@@ -19,19 +19,14 @@ package io.delta.tables
 import scala.collection.JavaConverters._
 import scala.collection.Map
 
-import org.apache.spark.sql.delta.{DeltaErrors, PreprocessTableMerge}
-import org.apache.spark.sql.delta.DeltaViewHelper
-import org.apache.spark.sql.delta.commands.MergeIntoCommand
 import org.apache.spark.sql.delta.util.AnalysisHelper
 
 import org.apache.spark.annotation._
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
-import org.apache.spark.sql.catalyst.expressions.{AttributeReference, NamedExpression}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.functions.expr
-import org.apache.spark.sql.internal.SQLConf
 
 /**
  * Builder to specify how to merge data from source DataFrame into the target Delta table.
@@ -123,7 +118,8 @@ class DeltaMergeBuilder private(
     private val targetTable: DeltaTable,
     private val source: DataFrame,
     private val onCondition: Column,
-    private val whenClauses: Seq[DeltaMergeIntoClause])
+    private val matchedActions: Seq[MergeAction],
+    private val notMatchedActions: Seq[MergeAction])
   extends AnalysisHelper
   with Logging
   {
@@ -205,87 +201,46 @@ class DeltaMergeBuilder private(
    */
   def execute(): Unit = improveUnsupportedOpError {
     val sparkSession = targetTable.toDF.sparkSession
-    // Note: We are explicitly resolving DeltaMergeInto plan rather than going to through the
-    // Analyzer using `Dataset.ofRows()` because the Analyzer incorrectly resolves all
-    // references in the DeltaMergeInto using both source and target child plans, even before
-    // DeltaAnalysis rule kicks in. This is because the Analyzer  understands only MergeIntoTable,
-    // and handles that separately by skipping resolution (for Delta) and letting the
-    // DeltaAnalysis rule do the resolving correctly. This can be solved by generating
-    // MergeIntoTable instead, which blocked by the different issue with MergeIntoTable as explained
-    // in the function `mergePlan` and https://issues.apache.org/jira/browse/SPARK-34962.
-    val resolvedMergeInto =
-      DeltaMergeInto.resolveReferencesAndSchema(mergePlan, sparkSession.sessionState.conf)(
-        tryResolveReferences(sparkSession) _)
-    if (!resolvedMergeInto.resolved) {
-      throw DeltaErrors.analysisException("Failed to resolve\n", plan = Some(resolvedMergeInto))
-    }
-    val strippedMergeInto = resolvedMergeInto.copy(
-      target = DeltaViewHelper.stripTempViewForMerge(resolvedMergeInto.target, SQLConf.get)
-    )
-    // Preprocess the actions and verify
-    val mergeIntoCommand =
-      PreprocessTableMerge(sparkSession.sessionState.conf)(strippedMergeInto)
-        .asInstanceOf[MergeIntoCommand]
-    sparkSession.sessionState.analyzer.checkAnalysis(mergeIntoCommand)
-    mergeIntoCommand.run(sparkSession)
+
+    val targetPlan = targetTable.toDF.queryExecution.analyzed
+    val sourcePlan = source.queryExecution.analyzed
+
+    val merge = MergeIntoTable(
+      targetPlan,
+      sourcePlan,
+      onCondition.expr,
+      matchedActions,
+      notMatchedActions)
+
+    toDataset(sparkSession, merge)
   }
 
   /**
-   * :: Unstable ::
-   *
-   * Private method for internal usage only. Do not call this directly.
+   * Creates a new DeltaMergeBuilder with the merge matched action in input.
+   * The method is meant for internal usage only. Do not call this directly.
    */
   @Unstable
-  private[delta] def withClause(clause: DeltaMergeIntoClause): DeltaMergeBuilder = {
+  private[delta] def withMatchedAction(action: MergeAction): DeltaMergeBuilder = {
     new DeltaMergeBuilder(
-      this.targetTable, this.source, this.onCondition, this.whenClauses :+ clause)
+      this.targetTable,
+      this.source,
+      this.onCondition,
+      this.matchedActions :+ action,
+      this.notMatchedActions)
   }
 
-  private def mergePlan: DeltaMergeInto = {
-    var targetPlan = targetTable.toDF.queryExecution.analyzed
-    val sourcePlan = source.queryExecution.analyzed
-
-    // If source and target have duplicate, pre-resolved references (can happen with self-merge),
-    // then rewrite the references in target with new exprId to avoid ambiguity.
-    // We rewrite the target instead of ths source because the source plan can be arbitrary and
-    // we know that the target plan is simple combination of LogicalPlan and an
-    // optional SubqueryAlias.
-    val duplicateResolvedRefs = targetPlan.outputSet.intersect(sourcePlan.outputSet)
-    if (duplicateResolvedRefs.nonEmpty) {
-      val refReplacementMap = duplicateResolvedRefs.toSeq.flatMap {
-        case a: AttributeReference =>
-          Some(a.exprId -> a.withExprId(NamedExpression.newExprId))
-        case _ => None
-      }.toMap
-      targetPlan = targetPlan.transformAllExpressions {
-        case a: AttributeReference if refReplacementMap.contains(a.exprId) =>
-          refReplacementMap(a.exprId)
-      }
-      logInfo("Rewritten duplicate refs between target and source plans: "
-        + refReplacementMap.toSeq.mkString(", "))
-    }
-
-    // Note: The Scala API cannot generate MergeIntoTable just like the SQL parser because
-    // UpdateAction in MergeIntoTable does not have any way to differentiate between
-    // the representations of `updateAll()` and `update(some-condition, empty-actions)`.
-    // More specifically, UpdateAction with a list of empty Assignments implicitly represents
-    // `updateAll()`, so there is no way to represent `update()` with zero column assignments
-    // (possible in Scala API, but syntactically not possible in SQL). This issue is tracked
-    // by https://issues.apache.org/jira/browse/SPARK-34962.
-    val merge = DeltaMergeInto(targetPlan, sourcePlan, onCondition.expr, whenClauses)
-    val finalMerge = if (duplicateResolvedRefs.nonEmpty) {
-      // If any expression contain duplicate, pre-resolved references, we can't simply
-      // replace the references in the same way as the target because we don't know
-      // whether the user intended to refer to the source or the target columns. Instead,
-      // we unresolve them (only the duplicate refs) and let the analysis resolve the ambiguity
-      // and throw the usual error messages when needed.
-      merge.transformExpressions {
-        case a: AttributeReference if duplicateResolvedRefs.contains(a) =>
-          UnresolvedAttribute(a.qualifier :+ a.name)
-      }
-    } else merge
-    logDebug("Generated merged plan:\n" + finalMerge)
-    finalMerge
+  /**
+   * Creates a new DeltaMergeBuilder not matched actions with the action in input.
+   * The method is meant for internal usage only. Do not call this directly.
+   */
+  @Unstable
+  private[delta] def withNotMatchedAction(action: MergeAction): DeltaMergeBuilder = {
+    new DeltaMergeBuilder(
+      this.targetTable,
+      this.source,
+      this.onCondition,
+      this.matchedActions,
+      this.notMatchedActions:+ action)
   }
 }
 
@@ -300,7 +255,7 @@ object DeltaMergeBuilder {
       targetTable: DeltaTable,
       source: DataFrame,
       onCondition: Column): DeltaMergeBuilder = {
-    new DeltaMergeBuilder(targetTable, source, onCondition, Nil)
+    new DeltaMergeBuilder(targetTable, source, onCondition, Nil, Nil)
   }
 }
 
@@ -366,10 +321,8 @@ class DeltaMergeMatchedActionBuilder private(
    * @since 0.3.0
    */
   def updateAll(): DeltaMergeBuilder = {
-    val updateClause = DeltaMergeIntoUpdateClause(
-      matchCondition.map(_.expr),
-      DeltaMergeIntoClause.toActions(Nil, Nil))
-    mergeBuilder.withClause(updateClause)
+    val updateAllAction = UpdateStarAction(matchCondition.map(_.expr))
+    mergeBuilder.withMatchedAction(updateAllAction)
   }
 
   /**
@@ -377,8 +330,8 @@ class DeltaMergeMatchedActionBuilder private(
    * @since 0.3.0
    */
   def delete(): DeltaMergeBuilder = {
-    val deleteClause = DeltaMergeIntoDeleteClause(matchCondition.map(_.expr))
-    mergeBuilder.withClause(deleteClause)
+    val deleteAction = DeleteAction(matchCondition.map(_.expr))
+    mergeBuilder.withMatchedAction(deleteAction)
   }
 
   private def addUpdateClause(set: Map[String, Column]): DeltaMergeBuilder = {
@@ -386,13 +339,11 @@ class DeltaMergeMatchedActionBuilder private(
       // Nothing to update = no need to add an update clause
       mergeBuilder
     } else {
-      val setActions = set.toSeq
-      val updateActions = DeltaMergeIntoClause.toActions(
-        colNames = setActions.map(x => UnresolvedAttribute.quotedString(x._1)),
-        exprs = setActions.map(x => x._2.expr),
-        isEmptySeqEqualToStar = false)
-      val updateClause = DeltaMergeIntoUpdateClause(matchCondition.map(_.expr), updateActions)
-      mergeBuilder.withClause(updateClause)
+      val assignments = set.map { case (targetColName, column) =>
+        Assignment(UnresolvedAttribute.quotedString(targetColName), column.expr)
+      }.toSeq
+      val updateAction = UpdateAction(matchCondition.map(_.expr), assignments)
+      mergeBuilder.withMatchedAction(updateAction)
     }
   }
 
@@ -480,20 +431,16 @@ class DeltaMergeNotMatchedActionBuilder private(
    * @since 0.3.0
    */
   def insertAll(): DeltaMergeBuilder = {
-    val insertClause = DeltaMergeIntoInsertClause(
-      notMatchCondition.map(_.expr),
-      DeltaMergeIntoClause.toActions(Nil, Nil))
-    mergeBuilder.withClause(insertClause)
+    val insertAllAction = InsertStarAction(notMatchCondition.map(_.expr))
+    mergeBuilder.withNotMatchedAction(insertAllAction)
   }
 
   private def addInsertClause(setValues: Map[String, Column]): DeltaMergeBuilder = {
-    val values = setValues.toSeq
-    val insertActions = DeltaMergeIntoClause.toActions(
-      colNames = values.map(x => UnresolvedAttribute.quotedString(x._1)),
-      exprs = values.map(x => x._2.expr),
-      isEmptySeqEqualToStar = false)
-    val insertClause = DeltaMergeIntoInsertClause(notMatchCondition.map(_.expr), insertActions)
-    mergeBuilder.withClause(insertClause)
+    val assignments = setValues.map { case (targetColName, column) =>
+      Assignment(UnresolvedAttribute.quotedString(targetColName), column.expr)
+    }.toSeq
+    val insertAction = InsertAction(notMatchCondition.map(_.expr), assignments)
+    mergeBuilder.withNotMatchedAction(insertAction)
   }
 
   private def toStrColumnMap(map: Map[String, String]): Map[String, Column] = {
