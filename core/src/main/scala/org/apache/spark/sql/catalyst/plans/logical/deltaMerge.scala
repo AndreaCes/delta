@@ -18,8 +18,6 @@ package org.apache.spark.sql.catalyst.plans.logical
 
 import java.util.Locale
 
-import scala.collection.mutable
-
 import org.apache.spark.sql.delta.{DeltaAnalysisException, DeltaIllegalArgumentException, DeltaUnsupportedOperationException}
 import org.apache.spark.sql.delta.schema.SchemaMergingUtils
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
@@ -121,6 +119,8 @@ sealed trait DeltaMergeIntoClause extends Expression with DeltaUnevaluable {
   override def dataType: DataType = null
   override def children: Seq[Expression] = condition.toSeq ++ actions
 
+  def asCatalystMergeAction: MergeAction
+
   /** Verify whether the expressions in the actions are of the right type */
   protected[logical] def verifyActions(): Unit = actions.foreach {
     case _: UnresolvedStar =>
@@ -154,7 +154,11 @@ object DeltaMergeIntoClause {
   }
 
   def toActions(assignments: Seq[Assignment]): Seq[Expression] = {
-    if (assignments.isEmpty) {
+    toActions(assignments, isEmptySeqEqualToStar = false)
+  }
+
+  def toActions(assignments: Seq[Assignment], isEmptySeqEqualToStar: Boolean): Seq[Expression] = {
+    if (assignments.isEmpty && isEmptySeqEqualToStar) {
       Seq[Expression](UnresolvedStar(None))
     } else {
       assignments.map {
@@ -187,14 +191,29 @@ case class DeltaMergeIntoUpdateClause(condition: Option[Expression], actions: Se
       copy(condition = None, actions = newChildren)
     }
   }
+
+  override def asCatalystMergeAction: MergeAction = {
+    verifyActions()
+    actions match {
+      case Seq(UnresolvedStar(None)) => UpdateStarAction(condition)
+      case other =>
+        val assignments = other.map { el =>
+          val deltaAssign = el.asInstanceOf[DeltaMergeAction]
+          Assignment(UnresolvedAttribute(deltaAssign.targetColNameParts), deltaAssign.expr)
+        }
+        UpdateAction(condition, assignments)
+    }
+  }
 }
 
 /** Represents the clause WHEN MATCHED THEN DELETE in MERGE. See [[DeltaMergeInto]]. */
 case class DeltaMergeIntoDeleteClause(condition: Option[Expression])
     extends DeltaMergeIntoMatchedClause {
   def this(condition: Option[Expression], actions: Seq[DeltaMergeAction]) = this(condition)
-  children
+
   override def actions: Seq[Expression] = Seq.empty
+
+  override def asCatalystMergeAction: MergeAction = DeleteAction(condition)
 
   override protected def withNewChildrenInternal(
       newChildren: IndexedSeq[Expression]): DeltaMergeIntoDeleteClause =
@@ -207,6 +226,19 @@ case class DeltaMergeIntoInsertClause(condition: Option[Expression], actions: Se
 
   def this(cond: Option[Expression], cols: Seq[UnresolvedAttribute], exprs: Seq[Expression]) =
     this(cond, DeltaMergeIntoClause.toActions(cols, exprs))
+
+  override def asCatalystMergeAction: MergeAction = {
+    verifyActions()
+    actions match {
+      case Seq(UnresolvedStar(None)) => InsertStarAction(condition)
+      case other =>
+        val assignments = other.map { el =>
+          val deltaAssign = el.asInstanceOf[DeltaMergeAction]
+          Assignment(UnresolvedAttribute(deltaAssign.targetColNameParts), deltaAssign.expr)
+        }
+        InsertAction(condition, assignments)
+    }
+  }
 
   override protected def withNewChildrenInternal(
       newChildren: IndexedSeq[Expression]): DeltaMergeIntoInsertClause =

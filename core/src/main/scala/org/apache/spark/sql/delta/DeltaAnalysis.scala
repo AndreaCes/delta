@@ -192,7 +192,8 @@ class DeltaAnalysis(session: SparkSession)
             update.condition,
             DeltaMergeIntoClause.toActions(update.assignments))
         case update: UpdateStarAction =>
-          DeltaMergeIntoUpdateClause(update.condition, DeltaMergeIntoClause.toActions(Nil))
+          DeltaMergeIntoUpdateClause(update.condition,
+            DeltaMergeIntoClause.toActions(Nil, isEmptySeqEqualToStar = true))
         case delete: DeleteAction =>
           DeltaMergeIntoDeleteClause(delete.condition)
         case other =>
@@ -205,7 +206,8 @@ class DeltaAnalysis(session: SparkSession)
             insert.condition,
             DeltaMergeIntoClause.toActions(insert.assignments))
         case insert: InsertStarAction =>
-          DeltaMergeIntoInsertClause(insert.condition, DeltaMergeIntoClause.toActions(Nil))
+          DeltaMergeIntoInsertClause(insert.condition,
+            DeltaMergeIntoClause.toActions(Nil, isEmptySeqEqualToStar = true))
         case other =>
           throw DeltaErrors.invalidMergeClauseWhenNotMatched(s"${other.prettyName}")
       }
