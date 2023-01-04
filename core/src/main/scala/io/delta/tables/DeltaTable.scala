@@ -494,7 +494,7 @@ class DeltaTable private[tables](
    * @since 0.3.0
    */
   def merge(source: DataFrame, condition: Column): DeltaMergeBuilder = {
-    DeltaMergeBuilder(this, source, condition)
+    DeltaMergeBuilder(this, this.table.options, source, condition)
   }
 
   /**

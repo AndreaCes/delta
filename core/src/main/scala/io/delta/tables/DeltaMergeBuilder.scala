@@ -121,12 +121,21 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap
  */
 class DeltaMergeBuilder private(
     private val targetTable: DeltaTable,
+    private val targetTableOptions: Map[String, String],
     private val source: DataFrame,
     private val onCondition: Column,
     private val whenClauses: Seq[DeltaMergeIntoClause])
   extends AnalysisHelper
   with Logging
   {
+
+    private def this(targetTable: DeltaTable,
+                     source: DataFrame,
+                     onCondition: Column,
+                     whenClauses: Seq[DeltaMergeIntoClause]) = {
+      this(targetTable, Map.empty, source, onCondition, whenClauses)
+    }
+
 
   /**
    * Build the actions to perform when the merge condition was matched.  This returns
@@ -220,7 +229,7 @@ class DeltaMergeBuilder private(
       onCondition.expr,
       matchedActions,
       notMatchedActions)
-    val finalMerge = unresolveDuplicateRef(merge)
+    val finalMerge = unresolveReferences(merge)
 
     toDataset(sparkSession, finalMerge)
   }
@@ -234,7 +243,8 @@ class DeltaMergeBuilder private(
       case r @ DeltaTableRelation(index) =>
         val v2Table = DeltaTableV2(
           sparkSession,
-          index.deltaLog.dataPath)
+          index.deltaLog.dataPath,
+          options = this.targetTableOptions.toMap)
         DataSourceV2Relation(v2Table,
           r.output, catalog = None,
           identifier = None,
@@ -242,15 +252,11 @@ class DeltaMergeBuilder private(
     }
   }
 
-  private def unresolveDuplicateRef(merge: MergeIntoTable): MergeIntoTable = {
-    val duplicatedRefs = merge.targetTable.outputSet.intersect(merge.sourceTable.outputSet)
-    if (duplicatedRefs.isEmpty) merge
-    else {
+  private def unresolveReferences(merge: MergeIntoTable): MergeIntoTable = {
       merge.transformExpressions {
-        case a: AttributeReference if duplicatedRefs.contains(a) =>
+        case a: AttributeReference =>
           UnresolvedAttribute(a.qualifier :+ a.name)
       }
-    }
   }
 
   /**
@@ -261,7 +267,8 @@ class DeltaMergeBuilder private(
   @Unstable
   private[delta] def withClause(clause: DeltaMergeIntoClause): DeltaMergeBuilder = {
     new DeltaMergeBuilder(
-      this.targetTable, this.source, this.onCondition, this.whenClauses :+ clause)
+      this.targetTable, this.targetTableOptions, this.source,
+      this.onCondition, this.whenClauses :+ clause)
   }
 }
 
@@ -277,6 +284,20 @@ object DeltaMergeBuilder {
       source: DataFrame,
       onCondition: Column): DeltaMergeBuilder = {
     new DeltaMergeBuilder(targetTable, source, onCondition, Nil)
+  }
+
+  /**
+   * :: Unstable ::
+   *
+   * Private method for internal usage only. Do not call this directly.
+   */
+  @Unstable
+  private[delta] def apply(
+                            targetTable: DeltaTable,
+                            targetTableOptions: Map[String, String],
+                            source: DataFrame,
+                            onCondition: Column): DeltaMergeBuilder = {
+    new DeltaMergeBuilder(targetTable, targetTableOptions, source, onCondition, Nil)
   }
 }
 
