@@ -240,7 +240,7 @@ class DeltaMergeBuilder private(
       sparkSession.sessionState.conf)
 
     targetStrippedViewPlan.transform {
-      case r @ DeltaTableRelation(index) =>
+      case r@DeltaTableRelation(index) =>
         val v2Table = DeltaTableV2(
           sparkSession,
           index.deltaLog.dataPath,
@@ -253,10 +253,14 @@ class DeltaMergeBuilder private(
   }
 
   private def unresolveReferences(merge: MergeIntoTable): MergeIntoTable = {
+    val duplicatedRefs = merge.targetTable.outputSet.intersect(merge.sourceTable.outputSet)
+    if (duplicatedRefs.isEmpty) merge
+    else {
       merge.transformExpressions {
-        case a: AttributeReference =>
+        case a: AttributeReference if duplicatedRefs.contains(a) =>
           UnresolvedAttribute(a.qualifier :+ a.name)
       }
+    }
   }
 
   /**
