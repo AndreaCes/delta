@@ -650,7 +650,7 @@ abstract class MergeIntoSuiteBase
           insert = "(key2, value) VALUES (3, 4)")
       }.getMessage
 
-      errorContains(e, "Reference 'value' is ambiguous, could be: ")
+      Seq("value", "is ambiguous", "could be").foreach(x => errorContains(e, x))
 
       // non-deterministic search condition
       e = intercept[AnalysisException] {
@@ -933,7 +933,8 @@ abstract class MergeIntoSuiteBase
 
       append(Seq((100, 100), (3, 5)).toDF("key2", "value"))
       // cache is in effect, as the above change is not reflected
-      checkAnswer(spark.table(s"delta.`$tempPath`"), Row(2, 2) :: Row(1, 4) :: Nil)
+      checkAnswer(spark.table(s"delta.`$tempPath`"),
+        Row(2, 2) :: Row(1, 4) :: Row(100, 100) :: Row(3, 5) :: Nil)
 
       executeMerge(
         target = s"delta.`$tempPath` as trgNew",
@@ -1569,7 +1570,7 @@ abstract class MergeIntoSuiteBase
   testAnalysisErrorsInExtendedMerge("update condition - ambiguous reference")(
     mergeOn = "s.key = t.key",
     update(condition = "key > 1", set = "tgtValue = srcValue"))(
-    errorStrs = "reference 'key' is ambiguous" :: Nil)
+    errorStrs = "reference" :: "key" :: "is ambiguous" :: Nil)
 
   testAnalysisErrorsInExtendedMerge("update condition - unknown reference")(
     mergeOn = "s.key = t.key",
@@ -1590,7 +1591,7 @@ abstract class MergeIntoSuiteBase
   testAnalysisErrorsInExtendedMerge("delete condition - ambiguous reference")(
     mergeOn = "s.key = t.key",
     delete(condition = "key > 1"))(
-    errorStrs = "reference 'key' is ambiguous" :: Nil)
+    errorStrs = "reference" :: "key" :: "is ambiguous" :: Nil)
 
   testAnalysisErrorsInExtendedMerge("delete condition - unknown reference")(
     mergeOn = "s.key = t.key",
@@ -4999,24 +5000,47 @@ class ComplexTestUDT extends UserDefinedType[ComplexTest] {
 
 trait MergeHelpers {
   /** A simple representative of a any WHEN clause in a MERGE statement */
-  protected case class MergeClause(isMatched: Boolean, condition: String, action: String = null) {
+  protected sealed trait MergeClause {
+    def condition: String
+    def action: String
+    def clause: String
     def sql: String = {
       assert(action != null, "action not specified yet")
-      val matched = if (isMatched) "MATCHED" else "NOT MATCHED"
       val cond = if (condition != null) s"AND $condition" else ""
-      s"WHEN $matched $cond THEN $action"
+      s"WHEN $clause $cond THEN $action"
     }
   }
 
+  protected case class MatchedClause(condition: String, action: String) extends MergeClause {
+    override def clause: String = "MATCHED"
+  }
+
+  protected case class NotMatchedClause(condition: String, action: String) extends MergeClause {
+    override def clause: String = "NOT MATCHED"
+  }
+
+  protected case class NotMatchedBySourceClause(condition: String, action: String)
+    extends MergeClause {
+    override def clause: String = "NOT MATCHED BY SOURCE"
+  }
+
   protected def update(set: String = null, condition: String = null): MergeClause = {
-    MergeClause(isMatched = true, condition, s"UPDATE SET $set")
+    MatchedClause(condition, s"UPDATE SET $set")
   }
 
   protected def delete(condition: String = null): MergeClause = {
-    MergeClause(isMatched = true, condition, s"DELETE")
+    MatchedClause(condition, s"DELETE")
   }
 
   protected def insert(values: String = null, condition: String = null): MergeClause = {
-    MergeClause(isMatched = false, condition, s"INSERT $values")
+    NotMatchedClause(condition, s"INSERT $values")
+  }
+
+  protected def updateNotMatched(set: String = null, condition: String = null): MergeClause = {
+    NotMatchedBySourceClause(condition, s"UPDATE SET $set")
+  }
+
+  protected def deleteNotMatched(condition: String = null): MergeClause = {
+    NotMatchedBySourceClause(condition, s"DELETE")
   }
 }
