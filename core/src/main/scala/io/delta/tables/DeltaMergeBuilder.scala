@@ -304,6 +304,7 @@ class DeltaMergeBuilder private(
     if (!resolvedMergeInto.resolved) {
       throw DeltaErrors.analysisException("Failed to resolve\n", plan = Some(resolvedMergeInto))
     }
+    resolvedMergeInto
   }
 
   /**
