@@ -308,53 +308,12 @@ class DeltaAnalysis(session: SparkSession)
 
       DeltaMergeInto.resolveReferencesAndSchema(deltaMerge, conf)(tryResolveReferences(session))
 
-    case deltaMerge: DeltaMergeInto if deltaMerge.childrenResolved && !deltaMerge.resolved =>
-      val strippedTargetPlan =
-        stripTempViewForMergeWrapper(deltaMerge.target).transformUp { case DeltaRelation(lr) => lr }
-      val mergeProcessedDuplicates =
-        preprocessDuplicateReferences(deltaMerge.copy(target = strippedTargetPlan))
+    case deltaMerge: DeltaMergeInto =>
+      val d = if (deltaMerge.childrenResolved && !deltaMerge.resolved) {
+        DeltaMergeInto.resolveReferencesAndSchema(deltaMerge, conf)(tryResolveReferences(session))
+      } else deltaMerge
+      d.copy(target = stripTempViewForMergeWrapper(d.target))
 
-      DeltaMergeInto
-        .resolveReferencesAndSchema(mergeProcessedDuplicates, conf)(tryResolveReferences(session))
-  }
-
-  private def preprocessDuplicateReferences(deltaMerge: DeltaMergeInto): DeltaMergeInto = {
-    // If source and target have duplicate, pre-resolved references (can happen with self-merge),
-    // then rewrite the references in target with new exprId to avoid ambiguity.
-    // We rewrite the target instead of ths source because the source plan can be arbitrary and
-    // we know that the target plan is simple combination of LogicalPlan and an
-    // optional SubqueryAlias.
-    val duplicateResolvedRefs = deltaMerge.target.outputSet.intersect(deltaMerge.source.outputSet)
-
-    if (duplicateResolvedRefs.nonEmpty) {
-      val refReplacementMap = duplicateResolvedRefs.toSeq.flatMap {
-        case a: AttributeReference =>
-          Some(a.exprId -> a.withExprId(NamedExpression.newExprId))
-        case _ => None
-      }.toMap
-
-      val newTarget = deltaMerge.target.transformAllExpressions {
-        case a: AttributeReference if refReplacementMap.contains(a.exprId) =>
-          refReplacementMap(a.exprId)
-      }
-
-      logInfo("Rewritten duplicate refs between target and source plans: "
-        + refReplacementMap.toSeq.mkString(", "))
-
-      val newMergePlan = deltaMerge.copy(target = newTarget)
-
-      // If any expression contain duplicate, pre-resolved references, we can't simply
-      // replace the references in the same way as the target because we don't know
-      // whether the user intended to refer to the source or the target columns. Instead,
-      // we unresolve them (only the duplicate refs) and let the analysis resolve the ambiguity
-      // and throw the usual error messages when needed.
-      newMergePlan.transformExpressions {
-        case a: AttributeReference if duplicateResolvedRefs.contains(a) =>
-          UnresolvedAttribute(a.qualifier :+ a.name)
-      }
-    } else {
-      deltaMerge
-    }
   }
 
   /**

@@ -336,11 +336,6 @@ case class DeltaMergeInto(
   override protected def withNewChildrenInternal(
       newChildren: IndexedSeq[LogicalPlan]): DeltaMergeInto =
     copy(target = newChildren(0), source = newChildren(1))
-
-  def duplicateResolved: Boolean = target.outputSet.intersect(source.outputSet).isEmpty
-
-  override lazy val resolved: Boolean =
-    expressions.forall(_.resolved) && childrenResolved && duplicateResolved
 }
 
 object DeltaMergeInto {
