@@ -21,6 +21,7 @@ import java.io.File
 import scala.collection.JavaConverters._
 
 import org.apache.spark.sql.delta.DeltaOperations.ManualUpdate
+import org.apache.spark.sql.delta.actions.TableFeatureProtocolUtils
 import org.apache.spark.sql.delta.commands.cdc.CDCReader._
 import org.apache.spark.sql.delta.schema.SchemaMergingUtils
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
@@ -41,6 +42,22 @@ trait DeltaCDCColumnMappingSuiteBase extends DeltaCDCSuiteBase
       df.drop(CDC_COMMIT_TIMESTAMP)
       .drop(CDC_TYPE_COLUMN_NAME)
       .drop(CDC_COMMIT_VERSION)
+  }
+
+  test("upgrade to column mapping not blocked") {
+    withTempDir { dir =>
+      setupInitialDeltaTable(dir, upgradeInNameMode = true)
+      implicit val deltaLog: DeltaLog = DeltaLog.forTable(spark, dir.getCanonicalPath)
+      val v1 = deltaLog.update().version
+      checkAnswer(
+        cdcRead(
+          new TablePath(dir.getCanonicalPath),
+          StartingVersion("0"),
+          EndingVersion(v1.toString),
+          Some(BatchCDFSchemaEndVersion)).dropCDCFields,
+        (0 until 10).map(_.toString).map(i => Row(i, i))
+      )
+    }
   }
 
   test("add column batch cdc read not blocked") {
@@ -88,7 +105,7 @@ trait DeltaCDCColumnMappingSuiteBase extends DeltaCDCSuiteBase
           SchemaMergingUtils.transformColumns(
             StructType.fromDDL("id INT, value STRING")) { (_, field, _) =>
             val refField = s1.metadata.schema(field.name)
-            field.copy(metadata = refField.metadata, nullable = false)
+            field.copy(metadata = refField.metadata)
           }
         txn.commit(s1.metadata.copy(schemaString = updatedSchema.json) :: Nil, ManualUpdate)
       }
@@ -100,7 +117,10 @@ trait DeltaCDCColumnMappingSuiteBase extends DeltaCDCSuiteBase
       val v3 = deltaLog.update().version
 
       // query all changes using latest schema blocked
-      assertBlocked(expectedIncompatSchemaVersion = v2, expectedReadSchemaVersion = v3) {
+      assertBlocked(
+          expectedIncompatSchemaVersion = 0,
+          expectedReadSchemaVersion = v3,
+          bySchemaChange = false) {
         cdcRead(
           new TablePath(dir.getCanonicalPath),
           StartingVersion("0"),
@@ -109,9 +129,10 @@ trait DeltaCDCColumnMappingSuiteBase extends DeltaCDCSuiteBase
 
       // query using end version also blocked if cross schema change
       assertBlocked(
-          expectedIncompatSchemaVersion = v2,
+          expectedIncompatSchemaVersion = 0,
           expectedReadSchemaVersion = v3,
-          schemaMode = BatchCDFSchemaEndVersion) {
+          schemaMode = BatchCDFSchemaEndVersion,
+          bySchemaChange = false) {
         cdcRead(
           new TablePath(dir.getCanonicalPath),
           StartingVersion("0"),
@@ -130,14 +151,15 @@ trait DeltaCDCColumnMappingSuiteBase extends DeltaCDCSuiteBase
       )
 
       val s2 = deltaLog.update()
-      // Change nullability
+
+      // Change nullability unsafely
       deltaLog.withNewTransaction { txn =>
-        // the schema was not nullable
+        // the schema was nullable, but we want to make it non-nullable
         val updatedSchema =
           SchemaMergingUtils.transformColumns(
             StructType.fromDDL("id INT, value string").asNullable) { (_, field, _) =>
             val refField = s1.metadata.schema(field.name)
-            field.copy(metadata = refField.metadata)
+            field.copy(metadata = refField.metadata, nullable = false)
           }
         txn.commit(s2.metadata.copy(schemaString = updatedSchema.json) :: Nil, ManualUpdate)
       }
@@ -150,19 +172,26 @@ trait DeltaCDCColumnMappingSuiteBase extends DeltaCDCSuiteBase
       val v5 = deltaLog.update().version
 
       // query changes using latest schema blocked
-      assertBlocked(expectedIncompatSchemaVersion = v4, expectedReadSchemaVersion = v5) {
+      // Note this is not detected as an illegal schema change, but a data violation, because
+      // we attempt to read using latest schema @ v5 (nullable=false) to read some past data @ v3
+      // (nullable=true), which is unsafe.
+      assertBlocked(
+          expectedIncompatSchemaVersion = v3,
+          expectedReadSchemaVersion = v5,
+          bySchemaChange = false) {
         cdcRead(
           new TablePath(dir.getCanonicalPath),
-          // v3 is the first post the data type schema change
+          // v3 is the first version post the data type schema change
           StartingVersion(v3.toString),
           EndingVersion(v5.toString)).collect()
       }
 
       // query using end version also blocked if cross schema change
       assertBlocked(
-          expectedIncompatSchemaVersion = v4,
+          expectedIncompatSchemaVersion = v3,
           expectedReadSchemaVersion = v5,
-          schemaMode = BatchCDFSchemaEndVersion) {
+          schemaMode = BatchCDFSchemaEndVersion,
+          bySchemaChange = false) {
         cdcRead(
           new TablePath(dir.getCanonicalPath),
           StartingVersion(v3.toString),
@@ -182,6 +211,56 @@ trait DeltaCDCColumnMappingSuiteBase extends DeltaCDCSuiteBase
     }
   }
 
+  test("overwrite table with invalid schema change in non-column mapping table is blocked") {
+    withTempDir { dir =>
+      withColumnMappingConf("none") {
+        // Create table action sequence
+        Seq((1, "a")).toDF("id", "name").write.format("delta").save(dir.getCanonicalPath)
+        implicit val log: DeltaLog = DeltaLog.forTable(spark, dir)
+        val v1 = log.update().version
+
+        // Overwrite with dropped column
+        Seq(2).toDF("id")
+          .write
+          .format("delta")
+          .mode("overwrite")
+          .option("overwriteSchema", "true")
+          .save(dir.getCanonicalPath)
+        val v2 = log.update().version
+
+        assertBlocked(
+            expectedIncompatSchemaVersion = v1,
+            expectedReadSchemaVersion = v2,
+            bySchemaChange = false) {
+          cdcRead(
+            new TablePath(dir.getCanonicalPath),
+            StartingVersion(v1.toString),
+            EndingVersion(v2.toString),
+            schemaMode = Some(BatchCDFSchemaEndVersion)).collect()
+        }
+
+        // Overwrite with a renamed column
+        Seq(3).toDF("id2")
+          .write
+          .format("delta")
+          .mode("overwrite")
+          .option("overwriteSchema", "true")
+          .save(dir.getCanonicalPath)
+        val v3 = log.update().version
+
+        assertBlocked(
+            expectedIncompatSchemaVersion = v2,
+            expectedReadSchemaVersion = v3,
+            bySchemaChange = false) {
+          cdcRead(
+            new TablePath(dir.getCanonicalPath),
+            StartingVersion(v2.toString),
+            EndingVersion(v3.toString)).collect()
+        }
+      }
+    }
+  }
+
   test("drop column batch cdc read blocked") {
     withTempDir { dir =>
       // Set up an initial table with 10 records in schema <id string, value string>
@@ -198,7 +277,10 @@ trait DeltaCDCColumnMappingSuiteBase extends DeltaCDCSuiteBase
       val v3 = deltaLog.update().version
 
       // query all changes using latest schema blocked
-      assertBlocked(expectedIncompatSchemaVersion = v2, expectedReadSchemaVersion = v3) {
+      assertBlocked(
+          expectedIncompatSchemaVersion = 0,
+          expectedReadSchemaVersion = v3,
+          bySchemaChange = false) {
         cdcRead(
           new TablePath(dir.getCanonicalPath),
           StartingVersion("0"),
@@ -231,9 +313,10 @@ trait DeltaCDCColumnMappingSuiteBase extends DeltaCDCSuiteBase
 
       // querying changes using endVersion schema blocked if crossing schema boundary
       assertBlocked(
-          expectedIncompatSchemaVersion = v2,
+          expectedIncompatSchemaVersion = 0,
           expectedReadSchemaVersion = v3,
-          schemaMode = BatchCDFSchemaEndVersion) {
+          schemaMode = BatchCDFSchemaEndVersion,
+          bySchemaChange = false) {
         cdcRead(
           new TablePath(dir.getCanonicalPath),
           StartingVersion("0"),
@@ -242,9 +325,10 @@ trait DeltaCDCColumnMappingSuiteBase extends DeltaCDCSuiteBase
       }
 
       assertBlocked(
-          expectedIncompatSchemaVersion = v2,
+          expectedIncompatSchemaVersion = v1,
           expectedReadSchemaVersion = v3,
-          schemaMode = BatchCDFSchemaEndVersion) {
+          schemaMode = BatchCDFSchemaEndVersion,
+          bySchemaChange = false) {
         cdcRead(
           new TablePath(dir.getCanonicalPath),
           StartingVersion(v1.toString),
@@ -280,9 +364,16 @@ trait DeltaCDCColumnMappingSuiteBase extends DeltaCDCSuiteBase
       writeDeltaData(Seq(11))
       val v5 = deltaLog.update().version
 
-      // The read is still blocked, even schema @ v0 looks the "same" as the latest schema
+      // The read is still blocked, even schema @ 0 looks the "same" as the latest schema
       // but the added column now maps to a different physical column.
-      assertBlocked(expectedIncompatSchemaVersion = v2, expectedReadSchemaVersion = v5) {
+      // Note that this bypasses all the schema change actions in between because:
+      // 1. The schema after dropping @ v2 is a subset of the read schema -> this is fine
+      // 2. The schema after adding back @ v4 is the same as latest schema -> this is fine
+      // but our final check against the starting schema would catch it.
+      assertBlocked(
+          expectedIncompatSchemaVersion = 0,
+          expectedReadSchemaVersion = v5,
+          bySchemaChange = false) {
         cdcRead(
           new TablePath(dir.getCanonicalPath),
           StartingVersion("0"),
@@ -319,7 +410,10 @@ trait DeltaCDCColumnMappingSuiteBase extends DeltaCDCSuiteBase
       val v3 = deltaLog.update().version
 
       // query all versions using latest schema blocked
-      assertBlocked(expectedIncompatSchemaVersion = v2, expectedReadSchemaVersion = v3) {
+      assertBlocked(
+          expectedIncompatSchemaVersion = 0,
+          expectedReadSchemaVersion = v3,
+          bySchemaChange = false) {
         cdcRead(
           new TablePath(dir.getCanonicalPath),
           StartingVersion("0"),
@@ -351,9 +445,10 @@ trait DeltaCDCColumnMappingSuiteBase extends DeltaCDCSuiteBase
 
       // query using endVersion schema across schema boundary also blocked
       assertBlocked(
-          expectedIncompatSchemaVersion = v2,
+          expectedIncompatSchemaVersion = 0,
           expectedReadSchemaVersion = v2,
-          schemaMode = BatchCDFSchemaEndVersion) {
+          schemaMode = BatchCDFSchemaEndVersion,
+          bySchemaChange = false) {
         cdcRead(
           new TablePath(dir.getCanonicalPath),
           StartingVersion("0"),
@@ -408,9 +503,10 @@ trait DeltaCDCColumnMappingSuiteBase extends DeltaCDCSuiteBase
 
       // query using endVersion schema is blocked if we cross schema boundary
       assertBlocked(
-          expectedIncompatSchemaVersion = v4,
+          expectedIncompatSchemaVersion = v3,
           expectedReadSchemaVersion = v5,
-          schemaMode = BatchCDFSchemaEndVersion) {
+          schemaMode = BatchCDFSchemaEndVersion,
+          bySchemaChange = false) {
         cdcRead(
           new TablePath(dir.getCanonicalPath),
           // v3 just pass the first schema change
@@ -506,12 +602,12 @@ trait DeltaCDCColumnMappingSuiteBase extends DeltaCDCSuiteBase
    *
    * The table contains 10 rows, with schema <id, value> both are string
    */
-  protected def setupInitialDeltaTable(dir: File): Unit = {
+  protected def setupInitialDeltaTable(dir: File, upgradeInNameMode: Boolean = false): Unit = {
     require(columnMappingModeString != NoMapping.name)
     val tablePath = dir.getCanonicalPath
     implicit val deltaLog: DeltaLog = DeltaLog.forTable(spark, tablePath)
 
-    if (columnMappingModeString == NameMapping.name) {
+    if (upgradeInNameMode && columnMappingModeString == NameMapping.name) {
       // For name mode, we do an upgrade then write to test that behavior as well
       // init table with 5 versions without column mapping
       withColumnMappingConf("none") {
@@ -520,19 +616,25 @@ trait DeltaCDCColumnMappingSuiteBase extends DeltaCDCSuiteBase
         ))
       }
       // upgrade to name mode
+      val protocol = deltaLog.snapshot.protocol
+      val (r, w) = if (protocol.supportsReaderFeatures || protocol.supportsWriterFeatures) {
+        (TableFeatureProtocolUtils.TABLE_FEATURES_MIN_READER_VERSION,
+          TableFeatureProtocolUtils.TABLE_FEATURES_MIN_WRITER_VERSION)
+      } else {
+        (ColumnMappingTableFeature.minReaderVersion, ColumnMappingTableFeature.minWriterVersion)
+      }
       sql(
         s"""
            |ALTER TABLE delta.`${dir.getCanonicalPath}`
            |SET TBLPROPERTIES (
            |  ${DeltaConfigs.COLUMN_MAPPING_MODE.key} = "name",
-           |  ${DeltaConfigs.MIN_READER_VERSION.key} = "2",
-           |  ${DeltaConfigs.MIN_WRITER_VERSION.key} = "5")""".stripMargin)
+           |  ${DeltaConfigs.MIN_READER_VERSION.key} = "$r",
+           |  ${DeltaConfigs.MIN_WRITER_VERSION.key} = "$w")""".stripMargin)
       // write more data
       writeDeltaData((5 until 10))
-    }
-    else if (columnMappingModeString == IdMapping.name) {
-      // For id mode, we could only create a table from scratch
-      withColumnMappingConf("id") {
+    } else {
+      // For id mode and non-upgrade name mode, we could just create a table from scratch
+      withColumnMappingConf(columnMappingModeString) {
         writeDeltaData((0 until 10), userSpecifiedSchema = Some(
           new StructType().add("id", StringType, true).add("value", StringType, true)
         ))

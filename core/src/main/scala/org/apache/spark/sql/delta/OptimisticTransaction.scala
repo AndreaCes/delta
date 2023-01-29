@@ -38,6 +38,7 @@ import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.stats._
 import org.apache.hadoop.fs.Path
 
+import org.apache.spark.SparkException
 import org.apache.spark.sql.{AnalysisException, Column, DataFrame, SparkSession}
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.util.CharVarcharUtils
@@ -264,6 +265,12 @@ trait OptimisticTransactionImpl extends TransactionalWrite
   // Whether this transaction is creating a new table.
   private var isCreatingNewTable: Boolean = false
 
+  // Whether this is a transaction that can select any new protocol, potentially downgrading
+  // the existing protocol of the table during REPLACE table operations.
+  private def canAssignAnyNewProtocol: Boolean =
+    readVersion == -1 ||
+      (isCreatingNewTable && spark.conf.get(DeltaSQLConf.REPLACE_TABLE_PROTOCOL_DOWNGRADE_ALLOWED))
+
   /**
    * Tracks the start time since we started trying to write a particular commit.
    * Used for logging duration of retried transactions.
@@ -394,10 +401,10 @@ trait OptimisticTransactionImpl extends TransactionalWrite
     }
 
 
-    if (isCreatingNewTable) {
+    if (canAssignAnyNewProtocol) {
       // Check for the new protocol version after the removal of the unenforceable not null
       // constraints
-      newProtocol = Some(Protocol.forNewTable(spark, latestMetadata))
+      newProtocol = Some(Protocol.forNewTable(spark, Some(latestMetadata)))
     } else if (latestMetadata.configuration.contains(Protocol.MIN_READER_VERSION_PROP) ||
       latestMetadata.configuration.contains(Protocol.MIN_WRITER_VERSION_PROP)) {
       // If the request contains protocol bump for an existing table, we must apply this change to
@@ -782,16 +789,36 @@ trait OptimisticTransactionImpl extends TransactionalWrite
 
   /**
    * Modifies the state of the log by adding a new commit that is based on a read at
-   * the given `lastVersion`.  In the case of a conflict with a concurrent writer this
+   * [[readVersion]]. In the case of a conflict with a concurrent writer this
+   * method will throw an exception.
+   *
+   * Also skips creating the commit if the configured [[IsolationLevel]] doesn't need us to record
+   * the commit from correctness perspective.
+   */
+  def commitIfNeeded(actions: Seq[Action], op: DeltaOperations.Operation): Unit = {
+    commitImpl(actions, op, canSkipEmptyCommits = true)
+  }
+
+  /**
+   * Modifies the state of the log by adding a new commit that is based on a read at
+   * [[readVersion]]. In the case of a conflict with a concurrent writer this
    * method will throw an exception.
    *
    * @param actions     Set of actions to commit
    * @param op          Details of operation that is performing this transactional commit
    */
+  def commit(actions: Seq[Action], op: DeltaOperations.Operation): Long = {
+    commitImpl(actions, op, canSkipEmptyCommits = false).getOrElse {
+      throw new SparkException(s"Unknown error while trying to commit for operation $op")
+    }
+  }
+
   @throws(classOf[ConcurrentModificationException])
-  def commit(actions: Seq[Action], op: DeltaOperations.Operation): Long = recordDeltaOperation(
-      deltaLog,
-      "delta.commit") {
+  protected def commitImpl(
+      actions: Seq[Action],
+      op: DeltaOperations.Operation,
+      canSkipEmptyCommits: Boolean
+  ): Option[Long] = recordDeltaOperation(deltaLog, "delta.commit") {
     commitStartNano = System.nanoTime()
 
     val (version, postCommitSnapshot, actualCommittedActions) = try {
@@ -850,6 +877,11 @@ trait OptimisticTransactionImpl extends TransactionalWrite
       }
 
       commitAttemptStartTime = clock.getTimeMillis()
+      if (preparedActions.isEmpty && canSkipEmptyCommits &&
+          skipRecordingEmptyCommitAllowed(isolationLevelToUse)) {
+        return None
+      }
+
       val (commitVersion, postCommitSnapshot, updatedCurrentTransactionInfo) =
         doCommitRetryIteratively(snapshot.version + 1, currentTransactionInfo, isolationLevelToUse)
       logInfo(s"Committed delta #$commitVersion to ${deltaLog.logPath}")
@@ -866,7 +898,17 @@ trait OptimisticTransactionImpl extends TransactionalWrite
 
     runPostCommitHooks(version, postCommitSnapshot, actualCommittedActions)
 
-    version
+    Some(version)
+  }
+
+  /** Whether to skip recording the commit in DeltaLog */
+  protected def skipRecordingEmptyCommitAllowed(isolationLevelToUse: IsolationLevel): Boolean = {
+    if (!spark.sessionState.conf.getConf(DeltaSQLConf.DELTA_SKIP_RECORDING_EMPTY_COMMITS)) {
+      return false
+    }
+    // Recording of empty commits in deltalog can be skipped only for SnapshotIsolation and
+    // Serializable mode.
+    Seq(SnapshotIsolation, Serializable).contains(isolationLevelToUse)
   }
 
   /**
@@ -977,7 +1019,7 @@ trait OptimisticTransactionImpl extends TransactionalWrite
         isolationLevel = Serializable.toString,
         txnId = Some(txnId))
 
-      recordDeltaEvent(deltaLog, "delta.commit.stats", data = stats)
+      recordDeltaEvent(deltaLog, DeltaLogging.DELTA_COMMIT_STATS_OPTYPE, data = stats)
       (attemptVersion, postCommitSnapshot)
     } catch {
       case e: java.nio.file.FileAlreadyExistsException =>
@@ -1109,7 +1151,7 @@ trait OptimisticTransactionImpl extends TransactionalWrite
       case newVersion: Protocol =>
         require(newVersion.minReaderVersion > 0, "The reader version needs to be greater than 0")
         require(newVersion.minWriterVersion > 0, "The writer version needs to be greater than 0")
-        if (!isCreatingNewTable) {
+        if (!canAssignAnyNewProtocol) {
           val currentVersion = snapshot.protocol
           if (!currentVersion.canUpgradeTo(newVersion)) {
             throw new ProtocolDowngradeException(currentVersion, newVersion)
@@ -1387,7 +1429,7 @@ trait OptimisticTransactionImpl extends TransactionalWrite
       numPartitionColumnsInTable = postCommitSnapshot.metadata.partitionColumns.size,
       isolationLevel = isolationLevel.toString,
       txnId = Some(txnId))
-    recordDeltaEvent(deltaLog, "delta.commit.stats", data = stats)
+    recordDeltaEvent(deltaLog, DeltaLogging.DELTA_COMMIT_STATS_OPTYPE, data = stats)
 
     postCommitSnapshot
   }

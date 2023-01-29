@@ -17,6 +17,7 @@
 package org.apache.spark.sql.delta
 
 import scala.collection.JavaConverters._
+import scala.collection.mutable
 import scala.util.{Failure, Success, Try}
 
 // scalastyle:off import.ordering.noEmptyLine
@@ -30,6 +31,7 @@ import org.apache.spark.sql.delta.constraints.{AddConstraint, DropConstraint}
 import org.apache.spark.sql.delta.files.{TahoeFileIndex, TahoeLogFileIndex}
 import org.apache.spark.sql.delta.metering.DeltaLogging
 import org.apache.spark.sql.delta.schema.SchemaUtils
+import org.apache.spark.sql.delta.sources._
 import org.apache.spark.sql.delta.util.AnalysisHelper
 import org.apache.hadoop.fs.Path
 
@@ -55,7 +57,7 @@ import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.{DataType, StructField, StructType}
+import org.apache.spark.sql.types.{ArrayType, DataType, IntegerType, StructField, StructType}
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
 /**
@@ -315,6 +317,7 @@ class DeltaAnalysis(session: SparkSession)
         DeltaMergeInto.resolveReferencesAndSchema(deltaMerge, conf)(tryResolveReferences(session))
       } else deltaMerge
       d.copy(target = stripTempViewForMergeWrapper(d.target))
+
 
   }
 
@@ -593,6 +596,9 @@ class DeltaAnalysis(session: SparkSession)
         attr
       case (s: StructType, t: StructType) if s != t =>
         addCastsToStructs(tblName, attr, s, t)
+      case (ArrayType(s: StructType, sNull: Boolean), ArrayType(t: StructType, tNull: Boolean))
+          if s != t && sNull == tNull =>
+        addCastsToArrayStructs(tblName, attr, s, t, sNull)
       case _ =>
         getCastFunction(attr, targetAttr.dataType, targetAttr.name)
     }
@@ -680,6 +686,22 @@ class DeltaAnalysis(session: SparkSession)
       parent.exprId, parent.qualifier, Option(parent.metadata))
   }
 
+  private def addCastsToArrayStructs(
+      tableName: String,
+      parent: NamedExpression,
+      source: StructType,
+      target: StructType,
+      sourceNullable: Boolean): Expression = {
+    val structConverter: (Expression, Expression) => Expression = (_, i) =>
+      addCastsToStructs(tableName, Alias(GetArrayItem(parent, i), i.toString)(), source, target)
+    val transformLambdaFunc = {
+      val elementVar = NamedLambdaVariable("elementVar", source, sourceNullable)
+      val indexVar = NamedLambdaVariable("indexVar", IntegerType, false)
+      LambdaFunction(structConverter(elementVar, indexVar), Seq(elementVar, indexVar))
+    }
+    ArrayTransform(parent, transformLambdaFunc)
+  }
+
   private def stripTempViewWrapper(plan: LogicalPlan): LogicalPlan = {
     DeltaViewHelper.stripTempView(plan, conf)
   }
@@ -687,6 +709,7 @@ class DeltaAnalysis(session: SparkSession)
   private def stripTempViewForMergeWrapper(plan: LogicalPlan): LogicalPlan = {
     DeltaViewHelper.stripTempViewForMerge(plan, conf)
   }
+
 }
 
 /** Matchers for dealing with a Delta table. */
@@ -786,6 +809,7 @@ case class DeltaDynamicPartitionOverwriteCommand(
   override def withNewTable(newTable: NamedRelation): DeltaDynamicPartitionOverwriteCommand = {
     copy(table = newTable)
   }
+
 
   override protected def withNewChildInternal(
       newChild: LogicalPlan): DeltaDynamicPartitionOverwriteCommand = copy(query = newChild)

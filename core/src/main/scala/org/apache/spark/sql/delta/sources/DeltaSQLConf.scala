@@ -294,6 +294,15 @@ trait DeltaSQLConfBase {
       .booleanConf
       .createWithDefault(true)
 
+  val DELTA_VACUUM_LOGGING_ENABLED =
+    buildConf("vacuum.logging.enabled")
+      .doc("Whether to log vacuum information into the Delta transaction log." +
+        " 'spark.databricks.delta.commitInfo.enabled' should be enabled when using this config." +
+        " Users should only set this config to 'true' when the underlying file system safely" +
+        " supports concurrent writes.")
+      .booleanConf
+      .createOptional
+
   val DELTA_VACUUM_RETENTION_CHECK_ENABLED =
     buildConf("retentionDurationCheck.enabled")
       .doc("Adds a check preventing users from running vacuum with a very short retention " +
@@ -890,7 +899,6 @@ trait DeltaSQLConfBase {
       .booleanConf
       .createWithDefault(false)
 
-
   val DELTA_STREAMING_UNSAFE_READ_ON_INCOMPATIBLE_SCHEMA_CHANGES_DURING_STREAM_SATRT =
     buildConf("streaming.unsafeReadOnIncompatibleSchemaChangesDuringStreamStart.enabled")
       .doc(
@@ -911,7 +919,6 @@ trait DeltaSQLConfBase {
       .internal()
       .booleanConf
       .createWithDefault(false)
-
 
   val DELTA_CDF_UNSAFE_BATCH_READ_ON_INCOMPATIBLE_SCHEMA_CHANGES =
     buildConf("changeDataFeed.unsafeBatchReadOnIncompatibleSchemaChanges.enabled")
@@ -993,12 +1000,11 @@ trait DeltaSQLConfBase {
 
   val RESTORE_TABLE_PROTOCOL_DOWNGRADE_ALLOWED =
     buildConf("restore.protocolDowngradeAllowed")
-      .doc("Whether a table may be restored to a lower protocol version than the current." +
-        " This setting also affects CLONE TABLE." +
-        " Note that allowing protocol downgrades may make the history unreadable. It is strongly" +
-        " recommended to wipe the table history with VACUUM RETAIN 0 HOURS after running a" +
-        " RESTORE or CLONE with this setting enabled. This command should also be run without any" +
-        " concurrent queries accessing the table until the history wipe is complete.")
+      .doc("""
+        | Whether a table RESTORE or CLONE operation may downgrade the protocol of the table.
+        | Note that depending on the protocol and the enabled table features, downgrading the
+        | protocol may break snapshot reconstruction and make the table unreadable. Protocol
+        | downgrades may also make the history unreadable.""".stripMargin)
       .booleanConf
       .createWithDefault(false)
 
@@ -1016,6 +1022,65 @@ trait DeltaSQLConfBase {
         " optimize queries that can be run purely on metadata.")
       .booleanConf
       .createWithDefault(true)
+
+  val DELTA_SKIP_RECORDING_EMPTY_COMMITS =
+    buildConf("skipRecordingEmptyCommits")
+      .internal()
+      .doc(
+        """
+          | Whether to skip recording an empty commit in the Delta Log. This only works when table
+          | is using SnapshotIsolation or Serializable Isolation Mode.
+          |""".stripMargin)
+      .booleanConf
+      .createWithDefault(true)
+
+  val REPLACE_TABLE_PROTOCOL_DOWNGRADE_ALLOWED =
+  buildConf("replace.protocolDowngradeAllowed")
+    .internal()
+    .doc("""
+       | Whether a REPLACE operation may downgrade the protocol of the table.
+       | Note that depending on the protocol and the enabled table features, downgrading the
+       | protocol may break snapshot reconstruction and make the table unreadable. Protocol
+       | downgrades may also make the history unreadable.""".stripMargin)
+    .booleanConf
+    .createWithDefault(false)
+
+  //////////////////
+  // Idempotent DML
+  //////////////////
+
+  val DELTA_IDEMPOTENT_DML_TXN_APP_ID =
+    buildConf("write.txnAppId")
+      .internal()
+      .doc("""
+             |The application ID under which this write will be committed.
+             | If specified, spark.databricks.delta.write.txnVersion also needs to
+             | be set.
+             |""".stripMargin)
+      .stringConf
+      .createOptional
+
+  val DELTA_IDEMPOTENT_DML_TXN_VERSION =
+    buildConf("write.txnVersion")
+      .internal()
+      .doc("""
+             |The user-defined version under which this write will be committed.
+             | If specified, spark.databricks.delta.write.txnAppId also needs to
+             | be set. To ensure idempotency, txnVersions across different writes
+             | need to be monotonically increasing.
+             |""".stripMargin)
+      .longConf
+      .createOptional
+
+  val DELTA_IDEMPOTENT_DML_AUTO_RESET_ENABLED =
+    buildConf("write.txnVersion.autoReset.enabled")
+      .internal()
+      .doc("""
+             |If true, will automatically reset spark.databricks.delta.write.txnVersion
+             |after every write. This is false by default.
+             |""".stripMargin)
+      .booleanConf
+      .createWithDefault(false)
 }
 
 object DeltaSQLConf extends DeltaSQLConfBase

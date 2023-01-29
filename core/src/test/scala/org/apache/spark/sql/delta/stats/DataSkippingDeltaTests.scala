@@ -629,19 +629,19 @@ trait DataSkippingDeltaTestsBase extends QueryTest
   }
 
   test("data skipping stats before and after optimize") {
-    val tempDir = Utils.createTempDir()
-    var r = DeltaLog.forTable(spark, new Path(tempDir.getCanonicalPath))
+      val tempDir = Utils.createTempDir()
+      var r = DeltaLog.forTable(spark, new Path(tempDir.getCanonicalPath))
 
-    val (numTuples, numFiles) = (10, 2)
-    val data = spark.range(0, numTuples, 1, 2).repartition(numFiles)
-    data.write.format("delta").save(r.dataPath.toString)
-    r = checkpointAndCreateNewLogIfNecessary(r)
-    def rStats: DataFrame =
-      getStatsDf(r, $"numRecords", $"minValues.id".as("id_min"), $"maxValues.id".as("id_max"))
+      val (numTuples, numFiles) = (10, 2)
+      val data = spark.range(0, numTuples, 1, 2).repartition(numFiles)
+      data.write.format("delta").save(r.dataPath.toString)
+      r = checkpointAndCreateNewLogIfNecessary(r)
+      def rStats: DataFrame =
+        getStatsDf(r, $"numRecords", $"minValues.id".as("id_min"), $"maxValues.id".as("id_max"))
 
-    checkAnswer(rStats, Seq(Row(4, 0, 8), Row(6, 1, 9)))
-    sql(s"OPTIMIZE '$tempDir'")
-    checkAnswer(rStats, Seq(Row(10, 0, 9)))
+      checkAnswer(rStats, Seq(Row(4, 0, 8), Row(6, 1, 9)))
+      sql(s"OPTIMIZE '$tempDir'")
+      checkAnswer(rStats, Seq(Row(10, 0, 9)))
   }
 
   test("number of indexed columns") {
@@ -1077,9 +1077,9 @@ trait DataSkippingDeltaTestsBase extends QueryTest
         .save(r.dataPath.toString)
 
       val hits = Seq(
-        "a = 1",  // In table
-        "isnull(c)",  // In table
-        "e = 20"  // No stats
+        "a = 1", // In table
+        "isnull(c)", // In table
+        "e = 20" // No stats
       )
       val misses = Seq(
         "a = 20",
@@ -1131,8 +1131,8 @@ trait DataSkippingDeltaTestsBase extends QueryTest
       df.write.mode("append").format("delta").save(dir.getAbsolutePath)
 
       val hits = Seq(
-        "gender = 'M'",  // No stats
-        "salary = 1000"  // No stats
+        "gender = 'M'", // No stats
+        "salary = 1000" // No stats
       )
       val misses = Seq(
         "name.firstname = 'Michael'",
@@ -1159,8 +1159,8 @@ trait DataSkippingDeltaTestsBase extends QueryTest
         .save(r.dataPath.toString)
 
       val hits = Seq(
-        "d = 40",  // No stats
-        "e = 40"  // No stats
+        "d = 40", // No stats
+        "e = 40" // No stats
       )
       // We can still collect NULL_COUNT for a, b, and c
       val misses = Seq(
@@ -1174,7 +1174,8 @@ trait DataSkippingDeltaTestsBase extends QueryTest
     // case-5: The first dataSkippingNumIndexedCols columns of the table schema has map or array
     // types, which we only collect NULL_COUNT
     withTable("table") {
-      sql("CREATE TABLE table (a Int, b Map<String, Int>, c Array<Int>, d Int, e Int) USING delta")
+      sql("CREATE TABLE table (a Int, b Map<String, Int>, c Array<Int>, d Int, e Int)" +
+        " USING delta")
       val r = DeltaLog.forTable(spark, new TableIdentifier("table"))
       // Only index the first three columns
       setNumIndexedColumns(r.dataPath.toString, 3)
@@ -1186,8 +1187,8 @@ trait DataSkippingDeltaTestsBase extends QueryTest
         .save(r.dataPath.toString)
 
       val hits = Seq(
-        "d = 50",  // No stats
-        "e = 50",  // No stats
+        "d = 50", // No stats
+        "e = 50", // No stats
         // No min/max stats for c. We couldn't check = for b since EqualTo does not support
         // ordering on type maP
         "c = array(50, 50)",
@@ -1249,7 +1250,7 @@ trait DataSkippingDeltaTestsBase extends QueryTest
 
   test("data skipping by partitions and data values - nulls") {
     val tableDir = Utils.createTempDir().getAbsolutePath
-    val dataSeqs = Seq(   // each sequence produce a single file
+    val dataSeqs = Seq( // each sequence produce a single file
       Seq((null, null)),
       Seq((null, "a")),
       Seq((null, "b")),
@@ -1263,10 +1264,10 @@ trait DataSkippingDeltaTestsBase extends QueryTest
     val allData = dataSeqs.flatten
 
     def checkResults(
-        predicate: String,
-        expResults: Seq[(String, String)],
-        expNumPartitions: Int,
-        expNumFiles: Long): Unit =
+                      predicate: String,
+                      expResults: Seq[(String, String)],
+                      expNumPartitions: Int,
+                      expNumFiles: Long): Unit =
       checkResultsWithPartitions(tableDir, predicate, expResults, expNumPartitions, expNumFiles)
 
     // Trivial base case
@@ -1299,93 +1300,93 @@ trait DataSkippingDeltaTestsBase extends QueryTest
       predicate = "key = 'a'",
       expResults = allData.filter(_._1 == "a"),
       expNumPartitions = 1,
-      expNumFiles = 1)   // 1 files with key = 'a'
+      expNumFiles = 1) // 1 files with key = 'a'
 
     checkResults(
       predicate = "key <=> 'a'",
       expResults = allData.filter(_._1 == "a"),
       expNumPartitions = 1,
-      expNumFiles = 1)   // 1 files with key <=> 'a'
+      expNumFiles = 1) // 1 files with key <=> 'a'
 
     checkResults(
       predicate = "key = 'b'",
       expResults = allData.filter(_._1 == "b"),
       expNumPartitions = 1,
-      expNumFiles = 1)   // 1 files with key = 'b'
+      expNumFiles = 1) // 1 files with key = 'b'
 
     checkResults(
       predicate = "key <=> 'b'",
       expResults = allData.filter(_._1 == "b"),
       expNumPartitions = 1,
-      expNumFiles = 1)   // 1 files with key <=> 'b'
+      expNumFiles = 1) // 1 files with key <=> 'b'
 
     // Conditions on partitions keys and values
     checkResults(
       predicate = "value IS NULL",
       expResults = allData.filter(_._2 == null),
       expNumPartitions = 3,
-      expNumFiles = 3)  // files with all non-NULL values get skipped
+      expNumFiles = 3) // files with all non-NULL values get skipped
 
     checkResults(
       predicate = "value IS NOT NULL",
       expResults = allData.filter(_._2 != null),
-      expNumPartitions = 2,  // one of the partitions has no files left after data skipping
-      expNumFiles = 3)  // files with all NULL values get skipped
+      expNumPartitions = 2, // one of the partitions has no files left after data skipping
+      expNumFiles = 3) // files with all NULL values get skipped
 
     checkResults(
       predicate = "value <=> NULL",
       expResults = allData.filter(_._2 == null),
       expNumPartitions = 3,
-      expNumFiles = 3)  // same as IS NULL case above
+      expNumFiles = 3) // same as IS NULL case above
 
     checkResults(
       predicate = "value = 'a'",
       expResults = allData.filter(_._2 == "a"),
-      expNumPartitions = 2,  // one partition has no files left after data skipping
-      expNumFiles = 2)  // only two files contain "a"
+      expNumPartitions = 2, // one partition has no files left after data skipping
+      expNumFiles = 2) // only two files contain "a"
 
     checkResults(
       predicate = "value <=> 'a'",
       expResults = allData.filter(_._2 == "a"),
-      expNumPartitions = 2,  // one partition has no files left after data skipping
-      expNumFiles = 2)  // only two files contain "a"
+      expNumPartitions = 2, // one partition has no files left after data skipping
+      expNumFiles = 2) // only two files contain "a"
 
     checkResults(
       predicate = "value <> 'a'",
-      expResults = allData.filter(x => x._2 != "a" && x._2 != null),  // i.e., only (null, b)
+      expResults = allData.filter(x => x._2 != "a" && x._2 != null), // i.e., only (null, b)
       expNumPartitions = 1,
-      expNumFiles = 1)  // only one file contains 'b'
+      expNumFiles = 1) // only one file contains 'b'
 
     checkResults(
       predicate = "value = 'b'",
       expResults = allData.filter(_._2 == "b"),
       expNumPartitions = 1,
-      expNumFiles = 1)   // same as previous case
+      expNumFiles = 1) // same as previous case
 
     checkResults(
       predicate = "value <=> 'b'",
       expResults = allData.filter(_._2 == "b"),
       expNumPartitions = 1,
-      expNumFiles = 1)   // same as previous case
+      expNumFiles = 1) // same as previous case
 
     // Conditions on both, partition keys and values
     checkResults(
       predicate = "key IS NULL AND value = 'a'",
       expResults = Seq((null, "a")),
       expNumPartitions = 1,
-      expNumFiles = 1)  // only one file in the partition has (*, "a")
+      expNumFiles = 1) // only one file in the partition has (*, "a")
 
     checkResults(
       predicate = "key IS NOT NULL AND value IS NOT NULL",
       expResults = Seq(("a", "a")),
       expNumPartitions = 1,
-      expNumFiles = 1)  // 1 file with (*, a)
+      expNumFiles = 1) // 1 file with (*, a)
 
     checkResults(
       predicate = "key <=> NULL AND value <=> NULL",
       expResults = Seq((null, null)),
       expNumPartitions = 1,
-      expNumFiles = 1)  // 3 files with key = null, but only 1 with val = null.
+      expNumFiles = 1) // 3 files with key = null, but only 1 with val = null.
 
     checkResults(
       predicate = "key <=> NULL OR value <=> NULL",
@@ -1463,6 +1464,26 @@ trait DataSkippingDeltaTestsBase extends QueryTest
     }
   }
 
+  test("Data skipping should always return files from latest commit version") {
+    withTempDir { dir =>
+      // If this test is flacky it is broken
+      Seq("aaa").toDF().write.format("delta").save(dir.getCanonicalPath)
+      val (log, snapshot) = DeltaLog.forTableWithSnapshot(spark, dir.getPath)
+      val addFile = snapshot.allFiles.collect().head
+      val fileWithStat = snapshot.getSpecificFilesWithStats(Seq(addFile.path)).head
+      // Ensure the stats has actual stats, not {}
+      assert(fileWithStat.stats.size > 2)
+      log.startTransaction().commitManually(addFile.copy(stats = "{}"))
+
+      // Delta dedup should always keep AddFile from newer version so
+      // getSpecificFilesWithStats should return the AddFile with empty stats
+      log.update()
+      val newfileWithStat =
+        log.unsafeVolatileSnapshot.getSpecificFilesWithStats(Seq(addFile.path)).head
+      assert(newfileWithStat.stats === "{}")
+    }
+  }
+
   protected def expectedStatsForFile(index: Int, colName: String, deltaLog: DeltaLog): String = {
       s"""{"numRecords":1,"minValues":{"$colName":$index},"maxValues":{"$colName":$index},""" +
         s""""nullCount":{"$colName":0}}""".stripMargin
@@ -1493,8 +1514,9 @@ trait DataSkippingDeltaTestsBase extends QueryTest
       sql(s"INSERT INTO delta.`$tableDirPath` VALUES (6)")
 
       // We want the file from the INSERT VALUES (6) stmt. However, this `getFilesRead` call might
-      // also return the AddFile (due to data file re-writes) from the DELETE stmt above. Since they
-      // were committed in different commits, we can select the addFile with the higher version
+      // also return the AddFile (due to data file re-writes) from the DELETE stmt above. Since
+      // they were committed in different commits, we can select the addFile with the higher
+      // version
       val addPathToCommitVersion = deltaLog.getChanges(0).flatMap {
         case (version, actions) => actions
           .collect { case a: AddFile => a }
@@ -1505,7 +1527,8 @@ trait DataSkippingDeltaTestsBase extends QueryTest
         .map(_.path)
         .maxBy(path => addPathToCommitVersion(path))
 
-      // At this point, our latest snapshot has only 3 rows: x=1, x=2, x=6 - all in different files
+      // At this point, our latest snapshot has only 3 rows: x=1, x=2, x=6 - all in
+      // different files
 
       // Case-1: all passes files to the API exists in the snapshot
       val result1 = deltaLog.snapshot.getSpecificFilesWithStats(Seq(file1, file2))

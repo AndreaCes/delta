@@ -196,10 +196,10 @@ trait DataSkippingReaderBase
   def path: Path
   def version: Long
   def metadata: Metadata
-  private[delta] def sizeInBytesOpt: Option[Long]
+  private[delta] def sizeInBytesIfKnown: Option[Long]
   def deltaLog: DeltaLog
   def schema: StructType
-  private[delta] def numOfFilesOpt: Option[Long]
+  private[delta] def numOfFilesIfKnown: Option[Long]
   def redactedPath: String
 
   private def useStats = spark.sessionState.conf.getConf(DeltaSQLConf.DELTA_STATS_SKIPPING)
@@ -446,7 +446,7 @@ trait DataSkippingReaderBase
       // Match any file whose null count is larger than zero.
       case IsNull(SkippingEligibleColumn(a, _)) =>
         statsProvider.getPredicateWithStatType(a, NULL_COUNT) { nullCount =>
-          nullCount > Literal(0)
+          nullCount > Literal(0L)
         }
       case Not(IsNull(e)) =>
         constructDataFilters(IsNotNull(e))
@@ -848,9 +848,9 @@ trait DataSkippingReaderBase
       recordDeltaOperation(deltaLog, "delta.skipping.none") {
         // When there are no filters we can just return allFiles with no extra processing
         val dataSize = DataSize(
-          bytesCompressed = sizeInBytesOpt,
+          bytesCompressed = sizeInBytesIfKnown,
           rows = None,
-          files = numOfFilesOpt)
+          files = numOfFilesIfKnown)
         return DeltaScan(
           version = version,
           files = getAllFiles(keepNumRecords),
@@ -886,7 +886,7 @@ trait DataSkippingReaderBase
       DeltaScan(
         version = version,
         files = files,
-        total = DataSize(sizeInBytesOpt, None, numOfFilesOpt),
+        total = DataSize(sizeInBytesIfKnown, None, numOfFilesIfKnown),
         partition = scanSize,
         scanned = scanSize)(
         scannedSnapshot = snapshotToScan,
@@ -951,9 +951,9 @@ trait DataSkippingReaderBase
       val scan = pruneFilesByLimit(withStats, limit)
 
       val totalDataSize = new DataSize(
-        sizeInBytesOpt,
+        sizeInBytesIfKnown,
         None,
-        numOfFilesOpt
+        numOfFilesIfKnown
       )
 
       val scannedDataSize = new DataSize(
@@ -992,9 +992,9 @@ trait DataSkippingReaderBase
       }
 
       val totalDataSize = new DataSize(
-        sizeInBytesOpt,
+        sizeInBytesIfKnown,
         None,
-        numOfFilesOpt
+        numOfFilesIfKnown
       )
 
       val scannedDataSize = new DataSize(

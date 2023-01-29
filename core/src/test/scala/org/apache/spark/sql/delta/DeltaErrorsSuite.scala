@@ -177,7 +177,7 @@ trait DeltaErrorsSuiteBase
         throw DeltaErrors.cdcColumnsInData(Seq("col1", "col2"))
       }
       assert(e.getErrorClass == "RESERVED_CDC_COLUMNS_ON_WRITE")
-      assert(e.getSqlState == "42000")
+      assert(e.getSqlState == "42939")
       assert(e.getMessage ==
         s"""
            |The write contains reserved columns [col1,col2] that are used
@@ -528,10 +528,10 @@ trait DeltaErrorsSuiteBase
              |You can use one of the following commands.
              |
              |If your table is already on the required protocol version:
-             |ALTER TABLE <table_name> SET TBLPROPERTIES ('delta.columnMapping.mode' = 'name')
+             |ALTER TABLE table_name SET TBLPROPERTIES ('delta.columnMapping.mode' = 'name')
              |
              |If your table is not on the required protocol version and requires a protocol upgrade:
-             |ALTER TABLE <table_name> SET TBLPROPERTIES (
+             |ALTER TABLE table_name SET TBLPROPERTIES (
              |   'delta.columnMapping.mode' = 'name',
              |   'delta.minReaderVersion' = '${newProtocol.minReaderVersion}',
              |   'delta.minWriterVersion' = '${newProtocol.minWriterVersion}')
@@ -1204,7 +1204,7 @@ trait DeltaErrorsSuiteBase
         throw DeltaErrors.activeSparkSessionNotFound()
       }
       assert(e.getErrorClass == "DELTA_ACTIVE_SPARK_SESSION_NOT_FOUND")
-      assert(e.getSqlState == "42000")
+      assert(e.getSqlState == "08003")
       assert(e.getMessage == "Could not find active SparkSession")
     }
     {
@@ -2332,8 +2332,8 @@ trait DeltaErrorsSuiteBase
 
       val msg =
         s"Cannot create table ('${tableId}')." +
-          s" The associated location ('${tableLocation}') is not empty but " +
-          "it's not a Delta table"
+          s" The associated location ('${tableLocation}') is not empty and " +
+          "also not a Delta table."
       assert(e.getMessage == msg)
     }
     {

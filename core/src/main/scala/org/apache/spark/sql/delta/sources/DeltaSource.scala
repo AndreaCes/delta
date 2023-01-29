@@ -131,6 +131,10 @@ trait DeltaSourceBase extends Source
   protected lazy val forceEnableUnsafeReadOnNullabilityChange =
     spark.sessionState.conf.getConf(DeltaSQLConf.DELTA_STREAM_UNSAFE_READ_ON_NULLABILITY_CHANGE)
 
+  protected val readSchemaAtSourceInit: StructType =
+      snapshotAtSourceInit.schema
+
+
   /**
    * A global flag to mark whether we have done a per-stream start check for column mapping
    * schema changes (rename / drop).
@@ -139,7 +143,7 @@ trait DeltaSourceBase extends Source
 
   override val schema: StructType = {
     val schemaWithoutCDC =
-      ColumnWithDefaultExprUtils.removeDefaultExpressions(snapshotAtSourceInit.schema)
+      ColumnWithDefaultExprUtils.removeDefaultExpressions(readSchemaAtSourceInit)
     if (options.readChangeFeed) {
       CDCReader.cdcReadSchema(schemaWithoutCDC)
     } else {
@@ -264,7 +268,8 @@ trait DeltaSourceBase extends Source
     deltaLog.createDataFrame(
       snapshotAtSourceInit,
       addFilesList,
-      isStreaming = true)
+      isStreaming = true
+    )
   }
 
   /**
@@ -405,7 +410,7 @@ trait DeltaSourceBase extends Source
       }
 
       // Compare stream metadata with that to detect column mapping schema changes
-      if (!DeltaColumnMapping.isColumnMappingReadCompatible(
+      if (!DeltaColumnMapping.hasNoColumnMappingSchemaChanges(
           snapshotAtSourceInit.metadata, snapshotAtStartVersionToScan.metadata)) {
         throw DeltaErrors.blockStreamingReadsOnColumnMappingEnabledTable(
           readSchema = snapshotAtSourceInit.schema,
@@ -455,7 +460,8 @@ trait DeltaSourceBase extends Source
       if (curVersion < snapshotAtSourceInit.version) {
         // Stream version is newer, ensure there's no column mapping schema changes
         // from cur -> stream.
-        if (!DeltaColumnMapping.isColumnMappingReadCompatible(metadataAtSourceInit, curMetadata)) {
+        if (!DeltaColumnMapping.hasNoColumnMappingSchemaChanges(
+            metadataAtSourceInit, curMetadata)) {
           throw DeltaErrors.blockStreamingReadsOnColumnMappingEnabledTable(
             curMetadata.schema,
             metadataAtSourceInit.schema,
@@ -465,7 +471,8 @@ trait DeltaSourceBase extends Source
       } else {
         // Current metadata action version is newer, ensure there's no column mapping schema changes
         // from stream -> cur.
-        if (!DeltaColumnMapping.isColumnMappingReadCompatible(curMetadata, metadataAtSourceInit)) {
+        if (!DeltaColumnMapping.hasNoColumnMappingSchemaChanges(
+            curMetadata, metadataAtSourceInit)) {
           throw DeltaErrors.blockStreamingReadsOnColumnMappingEnabledTable(
             metadataAtSourceInit.schema,
             curMetadata.schema,

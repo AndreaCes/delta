@@ -32,8 +32,8 @@ import org.apache.spark.sql.SparkSession
  * A base class for all table features.
  *
  * A feature can be <b>explicitly enabled</b> by a table's protocol when the protocol contains a
- * the feature's `name`. Writers (for writer-only features) or readers and writers (for
- * reader-writer features) must recognize enabled features and must handle them appropriately.
+ * feature's `name`. Writers (for writer-only features) or readers and writers (for reader-writer
+ * features) must recognize enabled features and must handle them appropriately.
  *
  * A table feature that released before Delta Table Features (reader version 3 and writer version
  * 7) is considered as a <b>legacy feature</b>. Legacy features are <b>implicitly enabled</b> when
@@ -185,18 +185,19 @@ object TableFeature {
    * All table features recognized by this client. Update this set when you added a new Table
    * Feature.
    *
-   * Warning: Do not call `get` on this Map to get a specific feature because keys in this map
-   * are in lower cases. Use [[featureNameToFeature]] instead.
+   * Warning: Do not call `get` on this Map to get a specific feature because keys in this map are
+   * in lower cases. Use [[featureNameToFeature]] instead.
    */
   private[delta] val allSupportedFeaturesMap: Map[String, TableFeature] = {
-    var features = Set[TableFeature](
+    var features: Set[TableFeature] = Set(
       AppendOnlyTableFeature,
       ChangeDataFeedTableFeature,
       CheckConstraintsTableFeature,
       IdentityColumnsTableFeature,
       GeneratedColumnsTableFeature,
       InvariantsTableFeature,
-      ColumnMappingTableFeature)
+      ColumnMappingTableFeature,
+      DeletionVectorsTableFeature)
     if (DeltaUtils.isTesting) {
       features ++= Set(
         TestLegacyWriterFeature,
@@ -292,6 +293,16 @@ object IdentityColumnsTableFeature
       metadata: Metadata,
       spark: SparkSession): Boolean = {
     ColumnWithDefaultExprUtils.hasIdentityColumn(metadata.schema)
+  }
+}
+
+object DeletionVectorsTableFeature
+  extends ReaderWriterFeature(name = "deletionVectors")
+  with FeatureAutomaticallyEnabledByMetadata {
+  override def metadataRequiresFeatureToBeEnabled(
+      metadata: Metadata,
+      spark: SparkSession): Boolean = {
+    DeltaConfigs.ENABLE_DELETION_VECTORS_CREATION.fromMetaData(metadata)
   }
 }
 

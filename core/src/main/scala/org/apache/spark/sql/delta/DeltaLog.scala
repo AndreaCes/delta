@@ -35,7 +35,7 @@ import org.apache.spark.sql.delta.commands.cdc.CDCReader
 import org.apache.spark.sql.delta.files.{TahoeBatchFileIndex, TahoeLogFileIndex}
 import org.apache.spark.sql.delta.metering.DeltaLogging
 import org.apache.spark.sql.delta.schema.{SchemaMergingUtils, SchemaUtils}
-import org.apache.spark.sql.delta.sources.DeltaSQLConf
+import org.apache.spark.sql.delta.sources._
 import org.apache.spark.sql.delta.storage.LogStoreProvider
 import com.google.common.cache.{CacheBuilder, RemovalNotification}
 import org.apache.hadoop.conf.Configuration
@@ -314,7 +314,7 @@ class DeltaLog private(
    * `read` and `write`.
    */
   private def protocolCheck(tableProtocol: Protocol, readOrWrite: String): Unit = {
-    val clientSupportedProtocol = Action.supportedProtocolVersion(Some(spark.sessionState.conf))
+    val clientSupportedProtocol = Action.supportedProtocolVersion()
     // Depending on the operation, pull related protocol versions out of Protocol objects.
     // `getEnabledFeatures` is a pointer to pull reader/writer features out of a Protocol.
     val (clientSupportedVersion, tableRequiredVersion, getEnabledFeatures) = readOrWrite match {
@@ -369,25 +369,25 @@ class DeltaLog private(
   }
 
   /**
-   * Asserts that the table's protocol enabled all <b>legacy</b> features that are active in the
-   * metadata.
+   * Asserts that the table's protocol enabled all features that are active in the metadata.
    *
    * A mismatch shouldn't happen when the table has gone through a proper write process because we
    * require all active features during writes. However, other clients may void this guarantee.
    */
-  def assertLegacyTableFeaturesMatch(targetProtocol: Protocol, targetMetadata: Metadata): Unit = {
+  def assertTableFeaturesMatchMetadata(
+      targetProtocol: Protocol,
+      targetMetadata: Metadata): Unit = {
     if (!targetProtocol.supportsReaderFeatures && !targetProtocol.supportsWriterFeatures) return
 
-    val protocolEnabledLegacyFeatures = targetProtocol.writerFeatureNames
+    val protocolEnabledFeatures = targetProtocol.writerFeatureNames
       .flatMap(TableFeature.featureNameToFeature)
-      .filter(_.isLegacyFeature)
     val activeFeatures: Set[TableFeature] =
       TableFeature.allSupportedFeaturesMap.values.collect {
         case f: TableFeature with FeatureAutomaticallyEnabledByMetadata
-            if f.isLegacyFeature && f.metadataRequiresFeatureToBeEnabled(targetMetadata, spark) =>
+            if f.metadataRequiresFeatureToBeEnabled(targetMetadata, spark) =>
           f
       }.toSet
-    val activeButNotEnabled = activeFeatures.diff(protocolEnabledLegacyFeatures)
+    val activeButNotEnabled = activeFeatures.diff(protocolEnabledFeatures)
     if (activeButNotEnabled.nonEmpty) {
       throw DeltaErrors.tableFeatureMismatchException(activeButNotEnabled.map(_.name))
     }
@@ -448,29 +448,32 @@ class DeltaLog private(
   /**
    * Returns a [[org.apache.spark.sql.DataFrame]] containing the new files within the specified
    * version range.
+   *
    */
   def createDataFrame(
       snapshot: Snapshot,
       addFiles: Seq[AddFile],
       isStreaming: Boolean = false,
-      actionTypeOpt: Option[String] = None): DataFrame = {
+      actionTypeOpt: Option[String] = None
+  ): DataFrame = {
     val actionType = actionTypeOpt.getOrElse(if (isStreaming) "streaming" else "batch")
     val fileIndex = new TahoeBatchFileIndex(spark, actionType, addFiles, this, dataPath, snapshot)
 
     val hadoopOptions = snapshot.metadata.format.options ++ options
+    val partitionSchema = snapshot.metadata.partitionSchema
+    val metadata = snapshot.metadata
+
 
     val relation = HadoopFsRelation(
       fileIndex,
-      partitionSchema =
-        DeltaColumnMapping.dropColumnMappingMetadata(snapshot.metadata.partitionSchema),
+      partitionSchema = DeltaColumnMapping.dropColumnMappingMetadata(partitionSchema),
       // We pass all table columns as `dataSchema` so that Spark will preserve the partition column
       // locations. Otherwise, for any partition columns not in `dataSchema`, Spark would just
       // append them to the end of `dataSchema`.
-      dataSchema =
-        DeltaColumnMapping.dropColumnMappingMetadata(
-          ColumnWithDefaultExprUtils.removeDefaultExpressions(snapshot.metadata.schema)),
+      dataSchema = DeltaColumnMapping.dropColumnMappingMetadata(
+        ColumnWithDefaultExprUtils.removeDefaultExpressions(metadata.schema)),
       bucketSpec = None,
-      snapshot.deltaLog.fileFormat(snapshot.metadata),
+      fileFormat(metadata),
       hadoopOptions)(spark)
 
     Dataset.ofRows(spark, LogicalRelation(relation, isStreaming = isStreaming))
@@ -792,7 +795,10 @@ object DeltaLog extends DeltaLogging {
       // - Different `authority` (e.g., different user tokens in the path)
       // - Different mount point.
       try {
-        deltaLogCache.get(path -> fileSystemOptions, () => createDeltaLog())
+        deltaLogCache.get(path -> fileSystemOptions, () => {
+            createDeltaLog()
+          }
+        )
       } catch {
         case e: com.google.common.util.concurrent.UncheckedExecutionException =>
           throw e.getCause

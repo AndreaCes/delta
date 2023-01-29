@@ -1937,10 +1937,10 @@ trait DeltaErrorsBase
        |You can use one of the following commands.
        |
        |If your table is already on the required protocol version:
-       |ALTER TABLE <table_name> SET TBLPROPERTIES ('delta.columnMapping.mode' = 'name')
+       |ALTER TABLE table_name SET TBLPROPERTIES ('delta.columnMapping.mode' = 'name')
        |
        |If your table is not on the required protocol version and requires a protocol upgrade:
-       |ALTER TABLE <table_name> SET TBLPROPERTIES (
+       |ALTER TABLE table_name SET TBLPROPERTIES (
        |   'delta.columnMapping.mode' = 'name',
        |   'delta.minReaderVersion' = '${requiredProtocol.minReaderVersion}',
        |   'delta.minWriterVersion' = '${requiredProtocol.minWriterVersion}')
@@ -2558,7 +2558,7 @@ trait DeltaErrorsBase
 
   def failedToGetSnapshotDuringColumnMappingStreamingReadCheck(cause: Throwable): Throwable = {
     new DeltaAnalysisException(
-      errorClass = "DELTA_STREAM_CHECK_COLUMN_MAPPING_NO_SNAPSHOT",
+      errorClass = "DELTA_STREAMING_CHECK_COLUMN_MAPPING_NO_SNAPSHOT",
       Array(DeltaSQLConf
         .DELTA_STREAMING_UNSAFE_READ_ON_INCOMPATIBLE_COLUMN_MAPPING_SCHEMA_CHANGES.key),
       Some(cause))
@@ -2623,6 +2623,7 @@ trait DeltaErrorsBase
           sparkConf, "/delta-utility.html#convert-a-parquet-table-to-a-delta-table")),
       cause = cause)
   }
+
 
   def cannotReconstructPathFromURI(uri: String): Throwable =
     new DeltaRuntimeException(

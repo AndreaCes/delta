@@ -95,7 +95,7 @@ class Snapshot(
   /** Performs validations during initialization */
   protected def init(): Unit = {
     deltaLog.protocolRead(protocol)
-    deltaLog.assertLegacyTableFeaturesMatch(protocol, metadata)
+    deltaLog.assertTableFeaturesMatchMetadata(protocol, metadata)
     SchemaUtils.recordUndefinedTypes(deltaLog, metadata.schema)
   }
 
@@ -137,7 +137,8 @@ class Snapshot(
             col("add.modificationTime"),
             col("add.dataChange"),
             col(ADD_STATS_TO_USE_COL_NAME).as("stats"),
-            col("add.tags")
+            col("add.tags"),
+            col("add.deletionVector")
           )))
         .withColumn("remove", when(
           col("remove.path").isNotNull,
@@ -308,9 +309,9 @@ class Snapshot(
   override def metadata: Metadata = _metadata
   override def protocol: Protocol = _protocol
   def fileSizeHistogram: Option[FileSizeHistogram] = computedState.fileSizeHistogram
-  private[delta] def sizeInBytesOpt: Option[Long] = Some(sizeInBytes)
-  private[delta] def setTransactionsOpt: Option[Seq[SetTransaction]] = Some(setTransactions)
-  private[delta] def numOfFilesOpt: Option[Long] = Some(numOfFiles)
+  private[delta] def sizeInBytesIfKnown: Option[Long] = Some(sizeInBytes)
+  private[delta] def setTransactionsIfKnown: Option[Seq[SetTransaction]] = Some(setTransactions)
+  private[delta] def numOfFilesIfKnown: Option[Long] = Some(numOfFiles)
 
   /**
    * Tombstones before the [[minFileRetentionTimestamp]] timestamp will be dropped from the
@@ -544,7 +545,7 @@ class InitialSnapshot(
   override protected lazy val computedState: Snapshot.State = initialState
   override def protocol: Protocol = computedState.protocol
   private def initialState: Snapshot.State = {
-    val protocol = Protocol.forNewTable(spark, metadata)
+    val protocol = Protocol.forNewTable(spark, Some(metadata))
     Snapshot.State(
       sizeInBytes = 0L,
       numOfSetTransactions = 0L,

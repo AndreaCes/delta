@@ -21,11 +21,13 @@ import java.net.URI
 
 // scalastyle:off import.ordering.noEmptyLine
 import org.apache.spark.sql.delta.actions.AddCDCFile
+import org.apache.spark.sql.delta.deletionvectors.DeletionVectorsSuite
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
 import org.apache.spark.sql.delta.storage.LocalLogStore
 import org.apache.spark.sql.delta.test.DeltaSQLCommandTest
 import org.apache.spark.sql.delta.test.DeltaTestImplicits._
 import org.apache.spark.sql.delta.util.FileNames
+import org.apache.commons.io.FileUtils
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FSDataOutputStream, Path, RawLocalFileSystem}
 import org.apache.hadoop.fs.permission.FsPermission
@@ -54,8 +56,9 @@ class CheckpointsSuite extends QueryTest
       val lastCheckpointOpt = deltaLog.readLastCheckpointFile()
       assert(lastCheckpointOpt.nonEmpty)
       assert(lastCheckpointOpt.get.checkpointSchema.nonEmpty)
+      val expectedCheckpointSchema = Seq("txn", "add", "remove", "metaData", "protocol")
       assert(lastCheckpointOpt.get.checkpointSchema.get.fieldNames.toSeq ===
-        Seq("txn", "add", "remove", "metaData", "protocol"))
+        expectedCheckpointSchema)
 
       spark.range(10).write.mode("append").format("delta").save(tempDir.getAbsolutePath)
       withSQLConf(DeltaSQLConf.CHECKPOINT_SCHEMA_WRITE_THRESHOLD_LENGTH.key-> "10") {
@@ -204,8 +207,8 @@ class CheckpointsSuite extends QueryTest
           deltaLog.checkpoint()
           val checkpointFile = FileNames.checkpointFileSingular(deltaLog.logPath, 1)
           val checkpointSchema = spark.read.format("parquet").load(checkpointFile.toString).schema
-          assert(checkpointSchema.fieldNames.toSeq ==
-            Seq("txn", "add", "remove", "metaData", "protocol"))
+          val expectedCheckpointSchema = Seq("txn", "add", "remove", "metaData", "protocol")
+          assert(checkpointSchema.fieldNames.toSeq == expectedCheckpointSchema)
         }
       }
     }
@@ -213,13 +216,15 @@ class CheckpointsSuite extends QueryTest
 
   test("checkpoint does not contain remove.tags and remove.numRecords") {
     withTempDir { tempDir =>
-      var expectedRemoveFileSchema = Seq(
+      val expectedRemoveFileSchema = Seq(
         "path",
         "deletionTimestamp",
         "dataChange",
         "extendedFileMetadata",
         "partitionValues",
-        "size")
+        "size",
+        "deletionVector")
+
       val tablePath = tempDir.getAbsolutePath
       // Append rows [0, 9] to table and merge tablePath.
       spark.range(end = 10).write.format("delta").mode("overwrite").save(tablePath)
@@ -255,6 +260,39 @@ class CheckpointsSuite extends QueryTest
       checkAnswer(
         spark.sql(s"select * from delta.`$tablePath`"),
         Seq(0, 0, 1, 1, 2, 2, 3, 3, 4, 4).map { i => Row(i) })
+    }
+  }
+
+  test("checkpoint with DVs") {
+    withTempDir { tempDir =>
+      val source = new File(DeletionVectorsSuite.table1Path) // this table has DVs in two versions
+      val target = new File(tempDir, "insertTest")
+
+      // Copy the source2 DV table to a temporary directory, so that we do updates to it
+      FileUtils.copyDirectory(source, target)
+
+      def insertData(data: String): Unit = {
+        spark.sql(s"INSERT INTO TABLE delta.`${target.getAbsolutePath}` $data")
+      }
+      val newData = Seq.range(3000, 3010)
+      newData.foreach { i => insertData(s"VALUES($i)") }
+
+      // Check the target file has checkpoint generated
+      val deltaLog = DeltaLog.forTable(spark, target.getAbsolutePath)
+      verifyCheckpoint(deltaLog.readLastCheckpointFile(), version = 10, parts = None)
+
+      // Delete the commit files 0-9, so that we are forced to read the checkpoint file
+      val logPath = new Path(new File(target, "_delta_log").getAbsolutePath)
+      for (i <- 0 to 10) {
+        val file = new File(FileNames.deltaFile(logPath, version = i).toString)
+        file.delete()
+      }
+
+      // Make sure the contents are the same
+      import testImplicits._
+      checkAnswer(
+        spark.sql(s"SELECT * FROM delta.`${target.getAbsolutePath}`"),
+        (DeletionVectorsSuite.expectedTable1DataV4 ++ newData).toSeq.toDF())
     }
   }
 }
