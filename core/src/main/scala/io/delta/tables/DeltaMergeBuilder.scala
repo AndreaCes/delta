@@ -18,8 +18,10 @@ package io.delta.tables
 
 import scala.collection.JavaConverters._
 import scala.collection.Map
+
 import org.apache.spark.sql.delta.{DeltaErrors, DeltaRelation, DeltaViewHelper}
 import org.apache.spark.sql.delta.util.AnalysisHelper
+
 import org.apache.spark.annotation._
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql._
@@ -241,6 +243,17 @@ class DeltaMergeBuilder private(
     toDataset(sparkSession, resolvedMerge)
   }
 
+  /**
+   * :: Unstable ::
+   *
+   * Private method for internal usage only. Do not call this directly.
+   */
+  @Unstable
+  private[delta] def withClause(clause: DeltaMergeIntoClause): DeltaMergeBuilder = {
+    new DeltaMergeBuilder(
+      this.targetTable, this.source, this.onCondition, this.whenClauses :+ clause)
+  }
+
   private def createDeltaMergePlan(sparkSession: SparkSession): DeltaMergeInto = {
     val sourcePlan = source.queryExecution.analyzed
 
@@ -307,16 +320,6 @@ class DeltaMergeBuilder private(
     resolvedMergeInto
   }
 
-  /**
-   * :: Unstable ::
-   *
-   * Private method for internal usage only. Do not call this directly.
-   */
-  @Unstable
-  private[delta] def withClause(clause: DeltaMergeIntoClause): DeltaMergeBuilder = {
-    new DeltaMergeBuilder(
-      this.targetTable, this.source, this.onCondition, this.whenClauses :+ clause)
-  }
 }
 
 object DeltaMergeBuilder {
