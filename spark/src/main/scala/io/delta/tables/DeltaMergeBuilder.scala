@@ -19,9 +19,7 @@ package io.delta.tables
 import scala.collection.JavaConverters._
 import scala.collection.Map
 
-import org.apache.spark.sql.delta.{DeltaErrors, PostHocResolveUpCast, PreprocessTableMerge}
-import org.apache.spark.sql.delta.DeltaViewHelper
-import org.apache.spark.sql.delta.commands.MergeIntoCommand
+import org.apache.spark.sql.delta.DeltaErrors
 import org.apache.spark.sql.delta.util.AnalysisHelper
 
 import org.apache.spark.annotation._
@@ -31,7 +29,6 @@ import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, NamedExpression}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.functions.expr
-import org.apache.spark.sql.internal.SQLConf
 
 /**
  * Builder to specify how to merge data from source DataFrame into the target Delta table.
@@ -265,88 +262,80 @@ class DeltaMergeBuilder private(
    */
   def execute(): Unit = improveUnsupportedOpError {
     val sparkSession = targetTable.toDF.sparkSession
-    // Note: We are explicitly resolving DeltaMergeInto plan rather than going to through the
-    // Analyzer using `Dataset.ofRows()` because the Analyzer incorrectly resolves all
-    // references in the DeltaMergeInto using both source and target child plans, even before
-    // DeltaAnalysis rule kicks in. This is because the Analyzer  understands only MergeIntoTable,
-    // and handles that separately by skipping resolution (for Delta) and letting the
-    // DeltaAnalysis rule do the resolving correctly. This can be solved by generating
-    // MergeIntoTable instead, which blocked by the different issue with MergeIntoTable as explained
-    // in the function `mergePlan` and https://issues.apache.org/jira/browse/SPARK-34962.
-    val resolvedMergeInto =
-      DeltaMergeInto.resolveReferencesAndSchema(mergePlan, sparkSession.sessionState.conf)(
-        tryResolveReferencesForExpressions(sparkSession))
-    if (!resolvedMergeInto.resolved) {
-      throw DeltaErrors.analysisException("Failed to resolve\n", plan = Some(resolvedMergeInto))
-    }
-    val strippedMergeInto = resolvedMergeInto.copy(
-      target = DeltaViewHelper.stripTempViewForMerge(resolvedMergeInto.target, SQLConf.get)
-    )
-    // Preprocess the actions and verify
-    var mergeIntoCommand =
-      PreprocessTableMerge(sparkSession.sessionState.conf)(strippedMergeInto)
-    // Resolve UpCast expressions that `PreprocessTableMerge` may have introduced.
-    mergeIntoCommand = PostHocResolveUpCast(sparkSession).apply(mergeIntoCommand)
-    sparkSession.sessionState.analyzer.checkAnalysis(mergeIntoCommand)
-    mergeIntoCommand.asInstanceOf[MergeIntoCommand].run(sparkSession)
+
+    val mergePlan = createDeltaMergePlan(sparkSession)
+    logDebug("Generated merged plan:\n" + mergePlan)
+
+    toDataset(sparkSession, mergePlan)
   }
 
-  /**
-   * :: Unstable ::
-   *
-   * Private method for internal usage only. Do not call this directly.
-   */
-  @Unstable
-  private[delta] def withClause(clause: DeltaMergeIntoClause): DeltaMergeBuilder = {
-    new DeltaMergeBuilder(
-      this.targetTable, this.source, this.onCondition, this.whenClauses :+ clause)
-  }
-
-  private def mergePlan: DeltaMergeInto = {
-    var targetPlan = targetTable.toDF.queryExecution.analyzed
+  private def createDeltaMergePlan(spark: SparkSession): DeltaMergeInto = {
     val sourcePlan = source.queryExecution.analyzed
 
-    // If source and target have duplicate, pre-resolved references (can happen with self-merge),
-    // then rewrite the references in target with new exprId to avoid ambiguity.
-    // We rewrite the target instead of ths source because the source plan can be arbitrary and
-    // we know that the target plan is simple combination of LogicalPlan and an
-    // optional SubqueryAlias.
-    val duplicateResolvedRefs = targetPlan.outputSet.intersect(sourcePlan.outputSet)
+    val targetPlan = targetTable.toDF.queryExecution.analyzed
+
+    val initialPlan = DeltaMergeInto(targetPlan, sourcePlan, onCondition.expr, whenClauses)
+
+    val planDeduplicate = deduplicateRelations(initialPlan)
+
+    resolveReferences(planDeduplicate, spark)
+  }
+
+  private def deduplicateRelations(mergePlan: DeltaMergeInto): DeltaMergeInto = {
+    val duplicateResolvedRefs = mergePlan.target.outputSet
+      .intersect(mergePlan.source.outputSet)
+
     if (duplicateResolvedRefs.nonEmpty) {
       val refReplacementMap = duplicateResolvedRefs.toSeq.flatMap {
         case a: AttributeReference =>
           Some(a.exprId -> a.withExprId(NamedExpression.newExprId))
         case _ => None
       }.toMap
-      targetPlan = targetPlan.transformAllExpressions {
+
+      // If source and target have duplicate, pre-resolved references (can happen with self-merge),
+      // then rewrite the references in target with new exprId to avoid ambiguity.
+      // We rewrite the target instead of ths source because the source plan can be arbitrary and
+      // we know that the target plan is simple combination of LogicalPlan and an
+      // optional SubqueryAlias.
+      val newTarget = mergePlan.target.transformAllExpressions {
         case a: AttributeReference if refReplacementMap.contains(a.exprId) =>
           refReplacementMap(a.exprId)
       }
-      logInfo("Rewritten duplicate refs between target and source plans: "
-        + refReplacementMap.toSeq.mkString(", "))
-    }
+      logInfo(
+        "Rewritten duplicate refs between target and source plans: "
+          + refReplacementMap.toSeq.mkString(", ")
+      )
 
-    // Note: The Scala API cannot generate MergeIntoTable just like the SQL parser because
-    // UpdateAction in MergeIntoTable does not have any way to differentiate between
-    // the representations of `updateAll()` and `update(some-condition, empty-actions)`.
-    // More specifically, UpdateAction with a list of empty Assignments implicitly represents
-    // `updateAll()`, so there is no way to represent `update()` with zero column assignments
-    // (possible in Scala API, but syntactically not possible in SQL). This issue is tracked
-    // by https://issues.apache.org/jira/browse/SPARK-34962.
-    val merge = DeltaMergeInto(targetPlan, sourcePlan, onCondition.expr, whenClauses)
-    val finalMerge = if (duplicateResolvedRefs.nonEmpty) {
+      val mergePlanNewTarget = mergePlan.copy(target = newTarget)
+
       // If any expression contain duplicate, pre-resolved references, we can't simply
       // replace the references in the same way as the target because we don't know
       // whether the user intended to refer to the source or the target columns. Instead,
       // we unresolve them (only the duplicate refs) and let the analysis resolve the ambiguity
       // and throw the usual error messages when needed.
-      merge.transformExpressions {
+      mergePlanNewTarget.transformExpressions {
         case a: AttributeReference if duplicateResolvedRefs.contains(a) =>
           UnresolvedAttribute(a.qualifier :+ a.name)
       }
-    } else merge
-    logDebug("Generated merged plan:\n" + finalMerge)
-    finalMerge
+    } else {
+      mergePlan
+    }
+  }
+
+  private def resolveReferences(mergePlan: DeltaMergeInto, spark: SparkSession): DeltaMergeInto = {
+    val resolvedMergeInto = DeltaMergeInto.resolveReferencesAndSchema(mergePlan,
+      spark.sessionState.conf)(tryResolveReferencesForExpressions(spark))
+    if (!resolvedMergeInto.resolved) {
+      throw DeltaErrors.analysisException("Failed to resolve\n", plan = Some(resolvedMergeInto))
+    }
+    resolvedMergeInto
+  }
+
+  private[delta] def withClause(clause: DeltaMergeIntoClause): DeltaMergeBuilder = {
+    new DeltaMergeBuilder(this.targetTable,
+      this.source,
+      this.onCondition,
+      this.whenClauses :+ clause)
   }
 }
 
